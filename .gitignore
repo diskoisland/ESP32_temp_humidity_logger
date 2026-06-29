@@ -1,0 +1,23 @@
+# Arduino / build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+*.merged.bin
+*.partitions.bin
+*.bootloader.bin
+
+# macOS
+.DS_Store
+
+# Local secrets
+Secrets.h
+
+# Editor files
+.vscode/
+.idea/
+
+# Local secrets, both common case variants
+Secrets.h
+secrets.h
