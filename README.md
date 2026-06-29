@@ -310,3 +310,7 @@ check the Serial Monitor for Wi-Fi errors.
 | `Secrets.example.h` | Template for local Wi-Fi AP settings |
 | `Secrets.h` | Local secrets file, not committed |
 | `README.md` | Project documentation |
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE` for details.
