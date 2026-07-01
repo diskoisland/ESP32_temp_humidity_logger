@@ -21,3 +21,9 @@ Secrets.h
 # Local secrets, both common case variants
 Secrets.h
 secrets.h
+
+# Local secrets files
+Secrets.h
+secrets.h
+Secrets*.h
+secrets*.h
