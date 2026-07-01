@@ -76,6 +76,7 @@ Preferences prefs;
 
 struct LogRow {
   DateTime timestamp;
+  int16_t utcOffsetMinutes;  // UTC offset in effect when this row was logged
   float avgTemperatureC;
   float minTemperatureC;
   float maxTemperatureC;
@@ -371,6 +372,7 @@ void logAggregate() {
 
   logRows[logWriteIndex] = {
     now,
+    (int16_t)rtcSyncUtcOffsetMinutes,
     avgTemperatureC,
     minTemperatureC,
     maxTemperatureC,
@@ -758,6 +760,8 @@ void handleLogJson() {
 
     json += "{";
     json += "\"time\":\"" + formatDateTime(logRows[index].timestamp) + "\",";
+    json += "\"timezone\":\"" + rtcSyncTimezone + "\",";
+    json += "\"utcOffsetMinutes\":" + String(logRows[index].utcOffsetMinutes) + ",";
     json += "\"avgTemperatureC\":" + String(logRows[index].avgTemperatureC, 2) + ",";
     json += "\"minTemperatureC\":" + String(logRows[index].minTemperatureC, 2) + ",";
     json += "\"maxTemperatureC\":" + String(logRows[index].maxTemperatureC, 2) + ",";
@@ -802,7 +806,7 @@ void handleLogCsv() {
     row += ",";
     row += csvEscape(rtcSyncTimezone);
     row += ",";
-    row += String(rtcSyncUtcOffsetMinutes);
+    row += String(logRows[index].utcOffsetMinutes);
     row += ",";
     row += String(logRows[index].avgTemperatureC, 2);
     row += ",";
@@ -813,6 +817,8 @@ void handleLogCsv() {
     row += String(logRows[index].avgHumidity, 2);
     row += ",";
     row += String(logRows[index].minHumidity, 2);
+    row += ",";
+    row += String(logRows[index].maxHumidity, 2);
     row += ",";
     row += String(logRows[index].sampleCount);
     row += "\n";
