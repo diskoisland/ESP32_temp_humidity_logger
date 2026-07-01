@@ -159,14 +159,19 @@ The webpage shows:
 - SHT-30 status
 - RTC battery/time status
 - RTC timezone
+- free heap and largest free block (memory-health indicator)
+- last restart reason (e.g. `poweron`, `brownout`, `sw_restart`, `task_watchdog`)
 - recent one-minute averaged readings
+
+When a reading is valid but the RTC is not set or has lost power, the latest-reading field shows **Live reading (RTC not set)** instead of a timestamp, so live temperature and humidity are still displayed while the clock needs attention.
 
 The webpage also provides buttons to:
 
 - sync the RTC to the browser device time
 - start logging
 - stop logging
-- download the CSV log
+- download the measurement CSV log
+- download the event log
 
 ## RTC sync
 
@@ -211,6 +216,33 @@ With a microSD card inserted, one-minute average readings are appended to:
 
 If no microSD card is fitted, the webpage still shows recent averaged readings stored in RAM. RAM-stored readings are lost when the ESP32 restarts.
 
+Logger events (boot, logging start/stop, Wi-Fi on/off, sensor/SD errors, scheduled reboots) are recorded separately in:
+
+```text
+/logger_events.csv
+```
+
+Each `boot` event records why the ESP32 last restarted in its `reason` column, from the chip's reset cause:
+
+| Reason | Meaning |
+| --- | --- |
+| `poweron` | Cold power-up |
+| `brownout` | Supply voltage dipped below the safe threshold — a power problem |
+| `sw_restart` | Normal scheduled reboot or firmware-requested restart |
+| `task_watchdog` / `int_watchdog` | A hang tripped the watchdog |
+| `panic` | Firmware crash |
+| `external_pin` | Reset via the reset pin |
+
+The same value is shown on the webpage as **Last restart** and returned in `/api/status` as `bootResetReason`. A run of `brownout` restarts points at an undervoltage or marginal power supply rather than a firmware issue.
+
+### Resuming logging after a reboot
+
+When logging is started, the choice is saved to the ESP32's non-volatile storage. After any reboot — the scheduled 7-day reboot, a watchdog reset, or a power cycle — the logger automatically resumes logging, provided the RTC is present, was previously synced, and has not lost power. Resumed logging is recorded as a `logging_start / auto_resume` event.
+
+A manual **Stop logging** is also saved, so a stopped logger stays stopped after a reboot. Logging only resumes automatically if it was active when the reboot occurred.
+
+Two things do not carry across a reboot: the recent-readings table shown on the webpage (RAM only) and the partially accumulated current minute. The on-SD CSV file is appended to, so the logged record itself is continuous. If the RTC coin cell has died and the clock is lost, auto-resume is held off until the RTC is synced again, to avoid logging with an unreliable timestamp.
+
 ## CSV columns
 
 ```text
@@ -221,7 +253,9 @@ timestamp,timezone,utc_offset_minutes,avg_temperature_c,min_temperature_c,max_te
 
 The firmware enables a watchdog timer.
 
-The logger also performs a scheduled reboot after approximately 7 days. If logging is active, the reboot waits until just after a completed log row so that the current one-minute average is not interrupted.
+The logger also performs a scheduled reboot after approximately 7 days. If logging is active, the reboot waits until just after a completed log row so that the current one-minute average is not interrupted. The periodic reboot also keeps long-term heap fragmentation in check.
+
+The webpage's **Free heap** card reports free memory and the largest contiguous free block. If free heap stays high but the largest block shrinks over time, the heap is fragmenting; the scheduled reboot resets it. CSV downloads are streamed row by row rather than built in memory, so exporting a full log does not require a large allocation.
 
 ## Solar shield placement
 

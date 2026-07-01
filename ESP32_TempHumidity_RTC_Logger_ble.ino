@@ -1,6 +1,7 @@
 /*
   SparkFun MicroMod ESP32 Temperature/Humidity Logger with hosted webpage,
-  microSD logging, RTC sync, watchdog, safe scheduled reboot, and NimBLE Wi-Fi control.
+  microSD logging, RTC sync, watchdog, safe scheduled reboot, event logging,
+  and NimBLE Wi-Fi control.
 
   Hardware assumed:
     - SparkFun MicroMod ESP32 Processor
@@ -37,6 +38,8 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_arduino_version.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 
 // -------- BLE settings --------
 const char *BLE_DEVICE_NAME = "SHT30-Logger";
@@ -55,6 +58,15 @@ const int I2C_SCL_PIN = 22;
 // SparkFun MicroMod ESP32 primary SPI mapping used by the Data Logging Carrier.
 const int SD_CS_PIN = 5;
 const char *LOG_FILENAME = "/temp_humidity_1min.csv";
+const char *EVENT_LOG_FILENAME = "/logger_events.csv";
+
+const char *LOG_CSV_HEADER =
+  "timestamp,timezone,utc_offset_minutes,"
+  "avg_temperature_c,min_temperature_c,max_temperature_c,"
+  "avg_humidity_percent,min_humidity_percent,max_humidity_percent,sample_count";
+
+const char *EVENT_CSV_HEADER =
+  "timestamp,timezone,utc_offset_minutes,event,reason,details";
 
 // -------- Globals --------
 WebServer server(80);
@@ -101,6 +113,8 @@ bool rtcWasSynced = false;
 String rtcSyncTimezone = "Not synced";
 int rtcSyncUtcOffsetMinutes = 0;
 
+const char *bootResetReason = "unknown";  // cause of the most recent restart
+
 float sumTemperatureC = 0.0;
 float minTemperatureC = NAN;
 float maxTemperatureC = NAN;
@@ -112,6 +126,8 @@ uint16_t aggregateSampleCount = 0;
 // -------- Forward declarations --------
 void processBleCommand(const String &command);
 String bleStatusText();
+void appendEventLog(const char *event, const char *reason, const String &details);
+void handleEventCsv();
 
 // -------- Helper functions --------
 String twoDigits(int value) {
@@ -127,6 +143,60 @@ String formatDateTime(const DateTime &dt) {
 String csvDateTime(const DateTime &dt) {
   return String(dt.year()) + "-" + twoDigits(dt.month()) + "-" + twoDigits(dt.day()) +
          "T" + twoDigits(dt.hour()) + ":" + twoDigits(dt.minute()) + ":" + twoDigits(dt.second());
+}
+
+String csvEscape(const String &value) {
+  String escaped = value;
+  escaped.replace("\"", "\"\"");
+
+  if (escaped.indexOf(',') >= 0 ||
+      escaped.indexOf('"') >= 0 ||
+      escaped.indexOf('\n') >= 0 ||
+      escaped.indexOf('\r') >= 0) {
+    escaped = "\"" + escaped + "\"";
+  }
+
+  return escaped;
+}
+
+void appendEventLog(const char *event, const char *reason, const String &details) {
+  Serial.print("Event: ");
+  Serial.print(event);
+  Serial.print(" / ");
+  Serial.print(reason);
+  Serial.print(" / ");
+  Serial.println(details);
+
+  // Event rows need a reliable timestamp. If the SD card or RTC is missing,
+  // the event is still printed to Serial but not written to the event CSV.
+  if (!sdOk || !rtcOk) return;
+
+  File file = SD.open(EVENT_LOG_FILENAME, FILE_APPEND);
+  if (!file) {
+    Serial.println("Could not open event log file.");
+    sdOk = false;
+    return;
+  }
+
+  if (file.size() == 0) {
+    file.println(EVENT_CSV_HEADER);
+  }
+
+  DateTime now = rtc.now();
+
+  file.print(csvDateTime(now));
+  file.print(",");
+  file.print(csvEscape(rtcSyncTimezone));
+  file.print(",");
+  file.print(rtcSyncUtcOffsetMinutes);
+  file.print(",");
+  file.print(csvEscape(String(event)));
+  file.print(",");
+  file.print(csvEscape(String(reason)));
+  file.print(",");
+  file.println(csvEscape(details));
+
+  file.close();
 }
 
 // -------- BLE command handling --------
@@ -155,8 +225,10 @@ void processBleCommand(const String &command) {
     startWifi();
 
     if (isWifiEnabled()) {
+      appendEventLog("wifi_on", "ble_command", "WIFI_ON");
       sendBleResponse("OK WIFI_ON ip=" + currentIpAddress());
     } else {
+      appendEventLog("wifi_on_failed", "ble_command", "WIFI_ON failed");
       sendBleResponse("ERROR WIFI_ON failed");
     }
 
@@ -165,28 +237,37 @@ void processBleCommand(const String &command) {
 
   if (command == "WIFI_OFF") {
     stopWifi();
+    appendEventLog("wifi_off", "ble_command", "WIFI_OFF");
     sendBleResponse("OK WIFI_OFF");
     return;
   }
 
   if (command == "STATUS") {
+    appendEventLog("status", "ble_command", "STATUS");
     sendBleResponse(bleStatusText());
     return;
   }
 
+  appendEventLog("unknown_ble_command", "ble_command", command);
   sendBleResponse("ERROR Unknown command. Use WIFI_ON, WIFI_OFF, or STATUS.");
 }
 
 // -------- Watchdog --------
 void setupWatchdog() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
+  // On Arduino-ESP32 3.x the Task WDT is already initialized by the core at
+  // boot, so esp_task_wdt_init() would return ESP_ERR_INVALID_STATE and leave
+  // the core defaults in place. Reconfigure the existing WDT instead, and only
+  // fall back to init() if the core did not bring it up.
   esp_task_wdt_config_t wdtConfig = {
     .timeout_ms = WATCHDOG_TIMEOUT_MS,
-    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .idle_core_mask = 0,       // watch only the loop task, not the idle tasks
     .trigger_panic = false
   };
 
-  esp_task_wdt_init(&wdtConfig);
+  if (esp_task_wdt_reconfigure(&wdtConfig) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&wdtConfig);
+  }
   esp_task_wdt_add(NULL);  // Add current Arduino loop task to watchdog
 #else
   esp_task_wdt_init(WATCHDOG_TIMEOUT_MS / 1000, false);
@@ -194,6 +275,7 @@ void setupWatchdog() {
 #endif
 
   Serial.println("Watchdog enabled.");
+  appendEventLog("watchdog_setup", "setup", "watchdog enabled");
 }
 
 // -------- Persistent config --------
@@ -227,24 +309,25 @@ void resetAggregate() {
 }
 
 void sampleSensor() {
-  if (!sensorOk || !rtcOk) return;
+  // Live readings only need the sensor. Timestamping and aggregation need the
+  // RTC, but a dead RTC should not blank out the live temp/humidity display.
+  if (!sensorOk) return;
 
   float temperatureC = sht31.readTemperature();
   float humidity = sht31.readHumidity();
 
   if (isnan(temperatureC) || isnan(humidity)) {
     latestValid = false;
+    appendEventLog("sensor_error", "sample_failed", "SHT-30 returned NaN");
     return;
   }
 
-  DateTime now = rtc.now();
-
   latestTemperatureC = temperatureC;
   latestHumidity = humidity;
-  latestTimestamp = now;
+  if (rtcOk) latestTimestamp = rtc.now();
   latestValid = true;
 
-  if (loggingEnabled) {
+  if (loggingEnabled && rtcOk) {
     sumTemperatureC += temperatureC;
     sumHumidity += humidity;
 
@@ -265,6 +348,21 @@ void sampleSensor() {
 }
 
 void logAggregate() {
+  // A pending scheduled reboot normally waits for a completed log row. But if
+  // no samples are accumulating (RTC dead or sensor returning NaN), a row will
+  // never complete, so don't defer the reboot forever.
+  if (rebootPending && (!rtcOk || aggregateSampleCount == 0)) {
+    appendEventLog(
+      "scheduled_reboot",
+      "seven_day_reboot",
+      "rebooting without a final log row (no pending samples)"
+    );
+
+    Serial.println("Scheduled reboot with no pending samples.");
+    delay(100);
+    ESP.restart();
+  }
+
   if (!rtcOk || aggregateSampleCount == 0) return;
 
   DateTime now = rtc.now();
@@ -289,9 +387,13 @@ void logAggregate() {
   if (sdOk) {
     File file = SD.open(LOG_FILENAME, FILE_APPEND);
     if (file) {
+      if (file.size() == 0) {
+        file.println(LOG_CSV_HEADER);
+      }
+
       file.print(csvDateTime(now));
       file.print(",");
-      file.print(rtcSyncTimezone);
+      file.print(csvEscape(rtcSyncTimezone));
       file.print(",");
       file.print(rtcSyncUtcOffsetMinutes);
       file.print(",");
@@ -310,6 +412,7 @@ void logAggregate() {
       file.println(aggregateSampleCount);
       file.close();
     } else {
+      appendEventLog("sd_error", "measurement_log_open_failed", "could not open measurement CSV");
       sdOk = false;
     }
   }
@@ -317,6 +420,12 @@ void logAggregate() {
   resetAggregate();
 
   if (rebootPending) {
+    appendEventLog(
+      "scheduled_reboot",
+      "seven_day_reboot",
+      "rebooting after completed log row"
+    );
+
     Serial.println("Scheduled reboot after completed log row.");
     delay(100);
     ESP.restart();
@@ -326,6 +435,12 @@ void logAggregate() {
 // -------- Web handlers --------
 void handleStartLogging() {
   if (!rtcOk || !rtcWasSynced || rtcBatteryConcern) {
+    appendEventLog(
+      "logging_blocked",
+      "web_command",
+      "start requested but RTC was not synced, invalid, or battery concern was active"
+    );
+
     server.send(400, "text/plain", "Sync RTC and confirm RTC is valid before starting logging.");
     return;
   }
@@ -336,6 +451,8 @@ void handleStartLogging() {
   lastLogMillis = millis();
 
   saveLoggingConfig();
+
+  appendEventLog("logging_start", "web_command", "user pressed Start logging");
 
   server.send(200, "text/plain", "Logging started.");
 }
@@ -348,13 +465,23 @@ void handleStopLogging() {
 
   saveLoggingConfig();
 
+  appendEventLog("logging_stop", "web_command", "user pressed Stop logging");
+
   server.send(200, "text/plain", "Logging stopped.");
 }
 
 String statusJson() {
   DateTime now = rtcOk ? rtc.now() : DateTime(2000, 1, 1, 0, 0, 0);
 
-  String json = "{";
+  // Heap health. largestFreeBlock / freeHeap is the fragmentation indicator:
+  // when free heap stays high but the largest block shrinks, the heap is
+  // fragmenting. Watch these over days of real use before optimizing further.
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+  String json;
+  json.reserve(1024);   // one allocation instead of ~40 reallocs while building
+  json = "{";
   json += "\"sensorOk\":";
   json += sensorOk ? "true" : "false";
   json += ",\"rtcOk\":";
@@ -396,6 +523,13 @@ String statusJson() {
   json += isWifiEnabled() ? "true" : "false";
   json += ",\"ip\":\"";
   json += currentIpAddress();
+  json += "\"";
+  json += ",\"freeHeap\":";
+  json += String(freeHeap);
+  json += ",\"largestFreeBlock\":";
+  json += String(largestFreeBlock);
+  json += ",\"bootResetReason\":\"";
+  json += bootResetReason;
   json += "\"";
   json += "}";
 
@@ -472,6 +606,8 @@ void handleRoot() {
       <div class="card"><div class="label">SHT-30 sensor</div><div id="sensorStatus" class="value small">--</div></div>
       <div class="card"><div class="label">RTC battery</div><div id="rtcBatteryStatus" class="value small">--</div></div>
       <div class="card"><div class="label">RTC timezone</div><div id="rtcTimezone" class="value small">--</div></div>
+      <div class="card"><div class="label">Free heap</div><div id="heapStatus" class="value small">--</div></div>
+      <div class="card"><div class="label">Last restart</div><div id="resetReason" class="value small">--</div></div>
     </section>
 
     <div class="row">
@@ -479,6 +615,7 @@ void handleRoot() {
       <button onclick="flashButton(this); startLogging()">Start logging</button>
       <button onclick="flashButton(this); stopLogging()">Stop logging</button>
       <a class="button" href="/log.csv" onclick="flashButton(this)">Download CSV</a>
+      <a class="button" href="/events.csv" onclick="flashButton(this)">Download Events</a>
     </div>
 
     <div id="message"></div>
@@ -515,7 +652,11 @@ void handleRoot() {
         status.latestValid ? `${status.humidity.toFixed(2)} %` : '--';
 
       document.getElementById('rtcTime').textContent = status.rtcTime;
-      document.getElementById('latestTime').textContent = status.latestTimestamp;
+
+      // With no RTC we still show the live reading, but the timestamp would be
+      // meaningless, so label it explicitly instead of printing a stale time.
+      document.getElementById('latestTime').textContent =
+        (status.latestValid && !status.rtcOk) ? 'Live reading (RTC not set)' : status.latestTimestamp;
       document.getElementById('sdStatus').textContent = status.sdOk ? 'Active' : 'No card';
       document.getElementById('sensorStatus').textContent = status.sensorOk ? 'Found / OK' : 'Not found';
 
@@ -533,6 +674,14 @@ void handleRoot() {
         status.rtcWasSynced
           ? `${status.rtcSyncTimezone}, UTC${status.rtcSyncUtcOffsetMinutes >= 0 ? '+' : ''}${status.rtcSyncUtcOffsetMinutes / 60}`
           : 'Not synced';
+
+      // Show free heap plus the largest contiguous block. If the two diverge
+      // (lots of free heap but a small largest block) the heap is fragmenting.
+      const freeKb = (status.freeHeap / 1024).toFixed(1);
+      const largestKb = (status.largestFreeBlock / 1024).toFixed(1);
+      document.getElementById('heapStatus').textContent = `${freeKb} kB (max block ${largestKb} kB)`;
+
+      document.getElementById('resetReason').textContent = status.bootResetReason;
 
       const log = await fetch('/api/log').then(r => r.json());
 
@@ -594,7 +743,9 @@ void handleStatus() {
 }
 
 void handleLogJson() {
-  String json = "{\"rows\":[";
+  String json;
+  json.reserve(4096);   // ~60 rows of JSON in one allocation, avoids realloc churn
+  json = "{\"rows\":[";
   uint16_t rowsToShow = min<uint16_t>(logCount, 60);
   bool firstRow = true;
 
@@ -632,25 +783,60 @@ void handleLogCsv() {
     }
   }
 
-  String csv = "timestamp,timezone,utc_offset_minutes,avg_temperature_c,min_temperature_c,max_temperature_c,avg_humidity_percent,min_humidity_percent,max_humidity_percent,sample_count\n";
+  // No SD file: stream the in-RAM ring buffer one row at a time. Building the
+  // whole CSV in a single String would be a ~130 KB allocation at full buffer,
+  // which can fail outright on a fragmented heap.
+  server.sendHeader("Content-Disposition", "attachment; filename=esp32-temp-humidity-log.csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent(String(LOG_CSV_HEADER) + "\n");
+
+  String row;
+  row.reserve(160);
 
   for (uint16_t i = 0; i < logCount; i++) {
     uint16_t index = (logWriteIndex + MAX_LOG_ROWS - logCount + i) % MAX_LOG_ROWS;
     if (!logRows[index].valid) continue;
 
-    csv += csvDateTime(logRows[index].timestamp) + ",";
-    csv += rtcSyncTimezone + ",";
-    csv += String(rtcSyncUtcOffsetMinutes) + ",";
-    csv += String(logRows[index].avgTemperatureC, 2) + ",";
-    csv += String(logRows[index].minTemperatureC, 2) + ",";
-    csv += String(logRows[index].maxTemperatureC, 2) + ",";
-    csv += String(logRows[index].avgHumidity, 2) + ",";
-    csv += String(logRows[index].minHumidity, 2) + ",";
-    csv += String(logRows[index].maxHumidity, 2) + ",";
-    csv += String(logRows[index].sampleCount) + "\n";
+    row = csvDateTime(logRows[index].timestamp);
+    row += ",";
+    row += csvEscape(rtcSyncTimezone);
+    row += ",";
+    row += String(rtcSyncUtcOffsetMinutes);
+    row += ",";
+    row += String(logRows[index].avgTemperatureC, 2);
+    row += ",";
+    row += String(logRows[index].minTemperatureC, 2);
+    row += ",";
+    row += String(logRows[index].maxTemperatureC, 2);
+    row += ",";
+    row += String(logRows[index].avgHumidity, 2);
+    row += ",";
+    row += String(logRows[index].minHumidity, 2);
+    row += ",";
+    row += String(logRows[index].sampleCount);
+    row += "\n";
+
+    server.sendContent(row);
+    esp_task_wdt_reset();   // keep long downloads from tripping the watchdog
   }
 
-  server.sendHeader("Content-Disposition", "attachment; filename=esp32-temp-humidity-log.csv");
+  server.sendContent("");   // terminate the chunked response
+}
+
+void handleEventCsv() {
+  if (sdOk && SD.exists(EVENT_LOG_FILENAME)) {
+    File file = SD.open(EVENT_LOG_FILENAME, FILE_READ);
+    if (file) {
+      server.sendHeader("Content-Disposition", "attachment; filename=logger-events.csv");
+      server.streamFile(file, "text/csv");
+      file.close();
+      return;
+    }
+  }
+
+  String csv = String(EVENT_CSV_HEADER) + "\n";
+  server.sendHeader("Content-Disposition", "attachment; filename=logger-events.csv");
   server.send(200, "text/csv", csv);
 }
 
@@ -706,6 +892,12 @@ void handleSyncRtc() {
   saveLoggingConfig();
   sampleSensor();
 
+  appendEventLog(
+    "rtc_sync",
+    "web_command",
+    "RTC synced from browser device using timezone " + rtcSyncTimezone
+  );
+
   server.send(200, "text/plain", "RTC synced to this device: " + formatDateTime(browserTime));
 }
 
@@ -715,6 +907,7 @@ void setupRoutes() {
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/log", HTTP_GET, handleLogJson);
   server.on("/log.csv", HTTP_GET, handleLogCsv);
+  server.on("/events.csv", HTTP_GET, handleEventCsv);
   server.on("/api/sync", HTTP_POST, handleSyncRtc);
   server.on("/api/logging/start", HTTP_POST, handleStartLogging);
   server.on("/api/logging/stop", HTTP_POST, handleStopLogging);
@@ -730,8 +923,21 @@ void setupSdCard() {
   if (!SD.exists(LOG_FILENAME)) {
     File file = SD.open(LOG_FILENAME, FILE_WRITE);
     if (file) {
-      file.println("timestamp,timezone,utc_offset_minutes,avg_temperature_c,min_temperature_c,max_temperature_c,avg_humidity_percent,min_humidity_percent,max_humidity_percent,sample_count");
+      file.println(LOG_CSV_HEADER);
       file.close();
+    } else {
+      sdOk = false;
+      return;
+    }
+  }
+
+  if (!SD.exists(EVENT_LOG_FILENAME)) {
+    File file = SD.open(EVENT_LOG_FILENAME, FILE_WRITE);
+    if (file) {
+      file.println(EVENT_CSV_HEADER);
+      file.close();
+    } else {
+      Serial.println("Could not create event log file.");
     }
   }
 }
@@ -740,14 +946,47 @@ void checkScheduledReboot() {
   if (millis() - bootMillis < REBOOT_INTERVAL_MS) return;
 
   if (loggingEnabled) {
-    // Wait until just after the next completed log row.
+    if (!rebootPending) {
+      appendEventLog(
+        "scheduled_reboot_pending",
+        "seven_day_reboot",
+        "waiting until after next completed log row"
+      );
+    }
+
     rebootPending = true;
     return;
   }
 
+  appendEventLog(
+    "scheduled_reboot",
+    "seven_day_reboot",
+    "rebooting while logging stopped"
+  );
+
   Serial.println("Scheduled reboot while logging stopped.");
   delay(100);
   ESP.restart();
+}
+
+// Maps the ESP32 reset cause to a short slug for the boot event. "brownout"
+// means the supply dipped below the safe threshold (a real power problem);
+// "sw_restart" is the normal scheduled reboot / ESP.restart(); the watchdog
+// and panic cases indicate a hang or crash rather than a power event.
+const char *resetReasonText(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external_pin";
+    case ESP_RST_SW:        return "sw_restart";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_watchdog";
+    case ESP_RST_TASK_WDT:  return "task_watchdog";
+    case ESP_RST_WDT:       return "other_watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep_wake";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
 }
 
 // -------- Arduino setup / loop --------
@@ -773,8 +1012,6 @@ void setup() {
   Serial.println(rtcOk ? "DS3231 RTC found." : "DS3231 RTC not found. Check wiring.");
   Serial.println(sdOk ? "microSD logging enabled." : "microSD card not found; logging recent readings in RAM only.");
 
-  setupWatchdog();
-
   if (rtcOk) {
     DateTime bootRtcTime = rtc.now();
 
@@ -789,18 +1026,36 @@ void setup() {
     rtcBatteryConcern = true;
   }
 
+  bootResetReason = resetReasonText(esp_reset_reason());
+  Serial.print("Reset reason: ");
+  Serial.println(bootResetReason);
+
+  appendEventLog(
+    "boot",
+    bootResetReason,
+    String("sensor=") + (sensorOk ? "ok" : "bad") +
+    ", rtc=" + (rtcOk ? "ok" : "bad") +
+    ", sd=" + (sdOk ? "ok" : "bad") +
+    ", resetReason=" + bootResetReason +
+    ", rtcLostPower=" + (rtcLostPower ? "true" : "false") +
+    ", rtcTimeWasBadAtBoot=" + (rtcTimeWasBadAtBoot ? "true" : "false")
+  );
+
+  setupWatchdog();
+
   if (autoLoggingWanted && rtcOk && !rtcBatteryConcern && rtcWasSynced) {
     loggingEnabled = true;
     resetAggregate();
     lastLogMillis = millis();
     Serial.println("Auto-resuming logging after reboot.");
+    appendEventLog("logging_start", "auto_resume", "logging resumed after reboot");
   } else {
     loggingEnabled = false;
   }
 
   setupRoutes();
   setupWifiControl(&server, AP_SSID, AP_PASSWORD);
-  startBle(BLE_DEVICE_NAME, processBleCommand);
+  startBle(BLE_DEVICE_NAME);
 
   // Wi-Fi starts off by default in the NimBLE variant.
   // Send BLE command WIFI_ON to enable the webpage.
@@ -813,6 +1068,12 @@ void setup() {
 }
 
 void loop() {
+  // Execute any BLE command on the main task (never on the NimBLE host task).
+  String bleCommand;
+  if (takeBleCommand(bleCommand)) {
+    processBleCommand(bleCommand);
+  }
+
   if (isWifiEnabled()) {
     server.handleClient();
   }

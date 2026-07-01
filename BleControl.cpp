@@ -6,7 +6,13 @@
 #define BLE_COMMAND_CHAR_UUID   "8b7e0002-7a1b-4c2d-9f5e-123456789abc"
 
 static NimBLECharacteristic *bleCommandCharacteristic = nullptr;
-static BleCommandHandler bleCommandHandler = nullptr;
+
+// Single-slot mailbox for a command received over BLE. The NimBLE callback
+// runs on the NimBLE host task; loop() drains it on the main Arduino task.
+// A critical section guards the shared String against concurrent access.
+static portMUX_TYPE bleCommandMux = portMUX_INITIALIZER_UNLOCKED;
+static String pendingBleCommand;
+static volatile bool bleCommandPending = false;
 
 class BleCommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
@@ -16,11 +22,28 @@ class BleCommandCallbacks : public NimBLECharacteristicCallbacks {
     command.trim();
     command.toUpperCase();
 
-    if (bleCommandHandler != nullptr) {
-      bleCommandHandler(command);
-    }
+    // Do the minimum here: stash the command and return. All Wi-Fi/SD/I2C work
+    // happens later in loop() so it never runs on the NimBLE host task.
+    portENTER_CRITICAL(&bleCommandMux);
+    pendingBleCommand = command;
+    bleCommandPending = true;
+    portEXIT_CRITICAL(&bleCommandMux);
   }
 };
+
+bool takeBleCommand(String &commandOut) {
+  bool hadCommand = false;
+
+  portENTER_CRITICAL(&bleCommandMux);
+  if (bleCommandPending) {
+    commandOut = pendingBleCommand;
+    bleCommandPending = false;
+    hadCommand = true;
+  }
+  portEXIT_CRITICAL(&bleCommandMux);
+
+  return hadCommand;
+}
 
 void sendBleResponse(const String &response) {
   if (bleCommandCharacteristic == nullptr) return;
@@ -32,9 +55,7 @@ void sendBleResponse(const String &response) {
   Serial.println(response);
 }
 
-void startBle(const char *deviceName, BleCommandHandler commandHandler) {
-  bleCommandHandler = commandHandler;
-
+void startBle(const char *deviceName) {
   NimBLEDevice::init(deviceName);
 
   NimBLEServer *bleServer = NimBLEDevice::createServer();
