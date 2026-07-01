@@ -132,6 +132,8 @@ After `WIFI_ON`, the response should include the access point IP address, usuall
 OK WIFI_ON ip=192.168.4.1
 ```
 
+A BLE client that stays connected but sends no command for 5 minutes is disconnected automatically. This prevents a phone that silently holds the connection (for example a backgrounded BLE app) from keeping the logger invisible to other scanners — while a client is connected, the device does not advertise. Advertising also restarts automatically after unclean disconnects, so the logger never needs a reboot to become discoverable again.
+
 ## Webpage
 
 After sending the BLE command:
@@ -161,6 +163,10 @@ The webpage shows:
 - RTC timezone
 - free heap and largest free block (memory-health indicator)
 - last restart reason (e.g. `poweron`, `brownout`, `sw_restart`, `task_watchdog`)
+- current log file name and size
+- SD card free space
+- site/deployment ID
+- RTC (enclosure) temperature
 - recent one-minute averaged readings
 
 When a reading is valid but the RTC is not set or has lost power, the latest-reading field shows **Live reading (RTC not set)** instead of a timestamp, so live temperature and humidity are still displayed while the clock needs attention.
@@ -172,6 +178,8 @@ The webpage also provides buttons to:
 - stop logging
 - download the measurement CSV log
 - download the event log
+- start a new log file (archives the current one)
+- edit configuration: site ID, calibration offsets, daily rotation, sensor heater cycling
 
 ## RTC sync
 
@@ -187,6 +195,8 @@ Before starting logging:
 
 The RTC sync uses the local date, time, timezone, and UTC offset from the phone or laptop viewing the webpage. Make sure that device has the correct time before syncing.
 
+Each sync also measures clock drift: the difference between the browser time and the RTC just before adjustment is recorded in the `rtc_sync` event (`driftSeconds`, positive = RTC was behind), along with the time since the previous sync. Over repeated syncs this characterizes each unit's drift rate.
+
 If the RTC loses power or reports an invalid time, logging is blocked until the RTC is synced again.
 
 ## Logging behavior
@@ -200,12 +210,14 @@ Each CSV row includes:
 - timestamp
 - timezone
 - UTC offset
+- site/deployment ID
 - average temperature
 - minimum temperature
 - maximum temperature
 - average humidity
 - minimum humidity
 - maximum humidity
+- RTC (enclosure) temperature
 - sample count
 
 With a microSD card inserted, one-minute average readings are appended to:
@@ -213,6 +225,31 @@ With a microSD card inserted, one-minute average readings are appended to:
 ```text
 /temp_humidity_1min.csv
 ```
+
+### Starting a new log file
+
+The webpage's **New log file** button archives the current measurement CSV and starts a fresh one — useful at the start of a new deployment or site visit. The previous file is renamed on the card using the RTC time, for example:
+
+```text
+/temp_humidity_1min_20260701_143005.csv
+```
+
+(with no clock available, a numbered `_oldN` name is used instead). Archived files stay on the microSD card and can be retrieved by reading the card in a computer; the download button always serves the current file. The rotation is recorded as a `log_file_rotated` event, and the recent-readings table on the webpage is cleared so it reflects only the new file.
+
+With **Daily file rotation** enabled in the configuration form, the same rotation happens automatically at the first logged row after each midnight, so files map one-to-one to calendar days.
+
+### Configuration
+
+The webpage's configuration form sets, persisted across reboots:
+
+- **Site ID** — a deployment/site label written into every CSV row (`site_id` column), so data from multiple units or sites stays attributable.
+- **Temperature / RH calibration offsets** — per-unit offsets applied to readings at sample time. Every change is recorded as a `config_changed` event with the values, so logged data remains traceable to the calibration in effect.
+- **Daily file rotation** — see above.
+- **Sensor heater cycling** — every 30 minutes the SHT-30's built-in heater runs for 30 seconds to drive off condensation, which otherwise pins RH near 100% and drifts the sensor in outdoor use. Sampling is suspended during the pulse and for a 90-second settle period, so heated readings never enter the averages (visible as a slightly lower `sample_count` in those minutes). Enabled by default; disable it for indoor use if preferred.
+
+### microSD auto-remount
+
+If the SD card fails or is removed, the logger keeps running (RAM-only) and retries mounting every 30 seconds. Re-seating or swapping the card in the field works without a reboot; recovery is recorded as an `sd_remounted` event.
 
 If no microSD card is fitted, the webpage still shows recent averaged readings stored in RAM. RAM-stored readings are lost when the ESP32 restarts.
 
@@ -246,8 +283,10 @@ Two things do not carry across a reboot: the recent-readings table shown on the 
 ## CSV columns
 
 ```text
-timestamp,timezone,utc_offset_minutes,avg_temperature_c,min_temperature_c,max_temperature_c,avg_humidity_percent,min_humidity_percent,max_humidity_percent,sample_count
+timestamp,timezone,utc_offset_minutes,site_id,avg_temperature_c,min_temperature_c,max_temperature_c,avg_humidity_percent,min_humidity_percent,max_humidity_percent,rtc_temperature_c,sample_count
 ```
+
+If the log file on the card was written by an older firmware with a different column layout, it is automatically archived at boot (`log_file_rotated / schema_changed` event) and a fresh file is started, so every file is internally consistent.
 
 ## Watchdog and scheduled reboot
 
@@ -344,6 +383,15 @@ check the Serial Monitor for Wi-Fi errors.
 | `Secrets.example.h` | Template for local Wi-Fi AP settings |
 | `Secrets.h` | Local secrets file, not committed |
 | `README.md` | Project documentation |
+
+## Planned upgrades
+
+Ideas noted for future work, roughly in priority order:
+
+- **Web file browser for archived logs** — list the archived `temp_humidity_1min_*.csv` files on the microSD card and allow downloading (and possibly deleting) them from the webpage, so old deployment segments can be retrieved without pulling the card.
+- **Battery / supply voltage sensing** — read the input rail so the logger can report battery state and warn before brownout. Needs a check of the Data Logging Carrier schematic for an ADC-accessible VIN/battery sense pin (may need a resistor divider).
+- **Reload recent readings from SD at boot** — repopulate the webpage's recent-readings table from the tail of the current CSV after a reboot, so the display is continuous across the 7-day restart.
+- **Calendar-valid RTC sync check** — reject impossible dates (e.g. February 31) in `/api/sync` instead of relying on per-field range checks.
 
 ## License
 

@@ -51,6 +51,13 @@ const unsigned long REBOOT_INTERVAL_MS = 7UL * 24UL * 60UL * 60UL * 1000UL;  // 
 const uint16_t MAX_LOG_ROWS = 1440;                 // 24 hours at one-minute averages
 const uint32_t WATCHDOG_TIMEOUT_MS = 30000;         // 30 second watchdog
 
+// SHT-30 heater cycling: a periodic pulse drives off condensation that can
+// pin RH near 100% and drift the sensor in outdoor/high-humidity use.
+// Samples are suspended during the heat pulse and the settle period after it.
+const unsigned long HEATER_PERIOD_MS = 30UL * 60UL * 1000UL;  // every 30 minutes
+const unsigned long HEATER_ON_MS = 30UL * 1000UL;             // heat for 30 s
+const unsigned long HEATER_SETTLE_MS = 90UL * 1000UL;         // re-equilibrate 90 s
+
 // SparkFun MicroMod ESP32 maps the primary MicroMod/Qwiic I2C bus to GPIO 21/22.
 const int I2C_SDA_PIN = 21;
 const int I2C_SCL_PIN = 22;
@@ -61,9 +68,10 @@ const char *LOG_FILENAME = "/temp_humidity_1min.csv";
 const char *EVENT_LOG_FILENAME = "/logger_events.csv";
 
 const char *LOG_CSV_HEADER =
-  "timestamp,timezone,utc_offset_minutes,"
+  "timestamp,timezone,utc_offset_minutes,site_id,"
   "avg_temperature_c,min_temperature_c,max_temperature_c,"
-  "avg_humidity_percent,min_humidity_percent,max_humidity_percent,sample_count";
+  "avg_humidity_percent,min_humidity_percent,max_humidity_percent,"
+  "rtc_temperature_c,sample_count";
 
 const char *EVENT_CSV_HEADER =
   "timestamp,timezone,utc_offset_minutes,event,reason,details";
@@ -83,6 +91,7 @@ struct LogRow {
   float avgHumidity;
   float minHumidity;
   float maxHumidity;
+  float rtcTemperatureC;  // DS3231 die temperature = enclosure temperature
   uint16_t sampleCount;
   bool valid;
 };
@@ -115,6 +124,23 @@ String rtcSyncTimezone = "Not synced";
 int rtcSyncUtcOffsetMinutes = 0;
 
 const char *bootResetReason = "unknown";  // cause of the most recent restart
+
+// User configuration, persisted in Preferences and settable via the web page.
+String siteId = "";                 // deployment/site label, written per CSV row
+float tempOffsetC = 0.0;            // per-unit calibration offset, applied at sample time
+float humidityOffset = 0.0;
+bool dailyRotateEnabled = false;    // archive the log file at each midnight boundary
+bool sensorHeaterEnabled = true;    // periodic SHT-30 condensation purge
+uint32_t rtcLastSyncUnix = 0;       // for drift-rate calculation between syncs
+
+// SHT-30 heater state machine (see manageSensorHeater()).
+bool heaterOn = false;
+bool heaterSettling = false;
+unsigned long heaterOnStartMillis = 0;
+unsigned long heaterSettleStartMillis = 0;
+unsigned long heaterLastCycleEndMillis = 0;
+
+int lastLogDay = -1;  // calendar day of the last logged row, for daily rotation
 
 float sumTemperatureC = 0.0;
 float minTemperatureC = NAN;
@@ -286,6 +312,12 @@ void saveLoggingConfig() {
   prefs.putBool("rtcSynced", rtcWasSynced);
   prefs.putString("tz", rtcSyncTimezone);
   prefs.putInt("utcOffset", rtcSyncUtcOffsetMinutes);
+  prefs.putString("siteId", siteId);
+  prefs.putFloat("tOffset", tempOffsetC);
+  prefs.putFloat("hOffset", humidityOffset);
+  prefs.putBool("dailyRot", dailyRotateEnabled);
+  prefs.putBool("heater", sensorHeaterEnabled);
+  prefs.putULong("lastSync", rtcLastSyncUnix);
   prefs.end();
 }
 
@@ -295,6 +327,12 @@ void loadLoggingConfig() {
   rtcWasSynced = prefs.getBool("rtcSynced", false);
   rtcSyncTimezone = prefs.getString("tz", "Not synced");
   rtcSyncUtcOffsetMinutes = prefs.getInt("utcOffset", 0);
+  siteId = prefs.getString("siteId", "");
+  tempOffsetC = prefs.getFloat("tOffset", 0.0);
+  humidityOffset = prefs.getFloat("hOffset", 0.0);
+  dailyRotateEnabled = prefs.getBool("dailyRot", false);
+  sensorHeaterEnabled = prefs.getBool("heater", true);
+  rtcLastSyncUnix = prefs.getULong("lastSync", 0);
   prefs.end();
 }
 
@@ -314,6 +352,10 @@ void sampleSensor() {
   // RTC, but a dead RTC should not blank out the live temp/humidity display.
   if (!sensorOk) return;
 
+  // Skip samples while the heater is on or the sensor is re-equilibrating;
+  // heated readings are biased warm/dry and must not enter the aggregates.
+  if (heaterOn || heaterSettling) return;
+
   float temperatureC = sht31.readTemperature();
   float humidity = sht31.readHumidity();
 
@@ -322,6 +364,13 @@ void sampleSensor() {
     appendEventLog("sensor_error", "sample_failed", "SHT-30 returned NaN");
     return;
   }
+
+  // Apply per-unit calibration offsets (set via the web page, stored in
+  // Preferences; changes are recorded in the event log for provenance).
+  temperatureC += tempOffsetC;
+  humidity += humidityOffset;
+  if (humidity < 0.0) humidity = 0.0;
+  if (humidity > 100.0) humidity = 100.0;
 
   latestTemperatureC = temperatureC;
   latestHumidity = humidity;
@@ -369,6 +418,19 @@ void logAggregate() {
   DateTime now = rtc.now();
   float avgTemperatureC = sumTemperatureC / aggregateSampleCount;
   float avgHumidity = sumHumidity / aggregateSampleCount;
+  float rtcTemperatureNow = rtc.getTemperature();  // DS3231 die = enclosure temp
+
+  // Optional daily rotation: when the calendar day changes, archive the
+  // previous day's file so files map one-to-one to days. The minute that spans
+  // midnight becomes the first row of the new day's file.
+  if (dailyRotateEnabled && sdOk && lastLogDay >= 0 && now.day() != lastLogDay) {
+    String archiveName;
+    if (rotateLogFile(archiveName)) {
+      appendEventLog("log_file_rotated", "daily_rotation",
+                     "previous day's file archived as " + archiveName);
+    }
+  }
+  lastLogDay = now.day();
 
   logRows[logWriteIndex] = {
     now,
@@ -379,6 +441,7 @@ void logAggregate() {
     avgHumidity,
     minHumidity,
     maxHumidity,
+    rtcTemperatureNow,
     aggregateSampleCount,
     true
   };
@@ -399,6 +462,8 @@ void logAggregate() {
       file.print(",");
       file.print(rtcSyncUtcOffsetMinutes);
       file.print(",");
+      file.print(csvEscape(siteId));
+      file.print(",");
       file.print(avgTemperatureC, 2);
       file.print(",");
       file.print(minTemperatureC, 2);
@@ -410,6 +475,8 @@ void logAggregate() {
       file.print(minHumidity, 2);
       file.print(",");
       file.print(maxHumidity, 2);
+      file.print(",");
+      file.print(rtcTemperatureNow, 2);
       file.print(",");
       file.println(aggregateSampleCount);
       file.close();
@@ -481,8 +548,40 @@ String statusJson() {
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
+  // Current log file size; only polled while Wi-Fi is up, so the extra SD
+  // open every status refresh is acceptable.
+  uint32_t logFileSize = 0;
+  bool logFileExists = false;
+  if (sdOk && SD.exists(LOG_FILENAME)) {
+    File logFile = SD.open(LOG_FILENAME, FILE_READ);
+    if (logFile) {
+      logFileSize = logFile.size();
+      logFileExists = true;
+      logFile.close();
+    }
+  }
+
+  // Card capacity/free space. The FAT free-cluster scan can be slow on large
+  // cards, so cache it and refresh only once a minute.
+  static unsigned long lastSpaceCheckMillis = 0;
+  static float sdTotalMb = 0.0;
+  static float sdFreeMb = 0.0;
+  if (sdOk) {
+    if (lastSpaceCheckMillis == 0 || millis() - lastSpaceCheckMillis >= 60000) {
+      lastSpaceCheckMillis = millis();
+      uint64_t totalBytes = SD.totalBytes();
+      uint64_t usedBytes = SD.usedBytes();
+      sdTotalMb = totalBytes / 1048576.0;
+      sdFreeMb = (totalBytes - usedBytes) / 1048576.0;
+    }
+  } else {
+    lastSpaceCheckMillis = 0;
+    sdTotalMb = 0.0;
+    sdFreeMb = 0.0;
+  }
+
   String json;
-  json.reserve(1024);   // one allocation instead of ~40 reallocs while building
+  json.reserve(1536);   // one allocation instead of ~50 reallocs while building
   json = "{";
   json += "\"sensorOk\":";
   json += sensorOk ? "true" : "false";
@@ -533,6 +632,30 @@ String statusJson() {
   json += ",\"bootResetReason\":\"";
   json += bootResetReason;
   json += "\"";
+  json += ",\"logFileName\":\"";
+  json += LOG_FILENAME;
+  json += "\",\"logFileExists\":";
+  json += logFileExists ? "true" : "false";
+  json += ",\"logFileSize\":";
+  json += String(logFileSize);
+  json += ",\"sdTotalMb\":";
+  json += String(sdTotalMb, 0);
+  json += ",\"sdFreeMb\":";
+  json += String(sdFreeMb, 0);
+  json += ",\"siteId\":\"";
+  json += siteId;
+  json += "\",\"tempOffsetC\":";
+  json += String(tempOffsetC, 2);
+  json += ",\"humidityOffset\":";
+  json += String(humidityOffset, 1);
+  json += ",\"dailyRotate\":";
+  json += dailyRotateEnabled ? "true" : "false";
+  json += ",\"heaterEnabled\":";
+  json += sensorHeaterEnabled ? "true" : "false";
+  json += ",\"heaterActive\":";
+  json += (heaterOn || heaterSettling) ? "true" : "false";
+  json += ",\"rtcTemperatureC\":";
+  json += String(rtcOk ? rtc.getTemperature() : 0.0, 2);
   json += "}";
 
   return json;
@@ -586,6 +709,12 @@ void handleRoot() {
     th { color: #52616b; font-size: 13px; }
     #message { min-height: 24px; color: #146c94; font-weight: 700; }
 
+    .config label { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+    .config input[type="text"], .config input[type="number"] {
+      padding: 8px; border: 1px solid #d7dee2; border-radius: 6px;
+      background: inherit; color: inherit; max-width: 130px;
+    }
+
     @media (prefers-color-scheme: dark) {
       body { background: #11181d; color: #edf4f7; }
       .card, table { background: #172026; border-color: #31414b; }
@@ -610,6 +739,10 @@ void handleRoot() {
       <div class="card"><div class="label">RTC timezone</div><div id="rtcTimezone" class="value small">--</div></div>
       <div class="card"><div class="label">Free heap</div><div id="heapStatus" class="value small">--</div></div>
       <div class="card"><div class="label">Last restart</div><div id="resetReason" class="value small">--</div></div>
+      <div class="card"><div class="label">Log file</div><div id="logFile" class="value small">--</div></div>
+      <div class="card"><div class="label">SD space</div><div id="sdSpace" class="value small">--</div></div>
+      <div class="card"><div class="label">Site ID</div><div id="siteIdView" class="value small">--</div></div>
+      <div class="card"><div class="label">RTC temp (enclosure)</div><div id="rtcTemp" class="value small">--</div></div>
     </section>
 
     <div class="row">
@@ -618,9 +751,24 @@ void handleRoot() {
       <button onclick="flashButton(this); stopLogging()">Stop logging</button>
       <a class="button" href="/log.csv" onclick="flashButton(this)">Download CSV</a>
       <a class="button" href="/events.csv" onclick="flashButton(this)">Download Events</a>
+      <button onclick="flashButton(this); newLogFile()">New log file</button>
     </div>
 
     <div id="message"></div>
+
+    <div class="card config">
+      <div class="label">Configuration</div>
+      <div class="row">
+        <label>Site ID <input id="cfgSiteId" type="text" maxlength="32"></label>
+        <label>Temp offset &deg;C <input id="cfgTempOffset" type="number" step="0.01"></label>
+        <label>RH offset % <input id="cfgHumOffset" type="number" step="0.1"></label>
+      </div>
+      <div class="row">
+        <label><input id="cfgDailyRotate" type="checkbox"> Daily file rotation</label>
+        <label><input id="cfgHeater" type="checkbox"> Sensor heater cycling</label>
+        <button onclick="flashButton(this); saveConfig()">Save configuration</button>
+      </div>
+    </div>
 
     <table>
       <thead>
@@ -636,6 +784,8 @@ void handleRoot() {
   </main>
 
   <script>
+    let configLoaded = false;
+
     function flashButton(button) {
       button.classList.add('pressed');
 
@@ -660,7 +810,11 @@ void handleRoot() {
       document.getElementById('latestTime').textContent =
         (status.latestValid && !status.rtcOk) ? 'Live reading (RTC not set)' : status.latestTimestamp;
       document.getElementById('sdStatus').textContent = status.sdOk ? 'Active' : 'No card';
-      document.getElementById('sensorStatus').textContent = status.sensorOk ? 'Found / OK' : 'Not found';
+
+      document.getElementById('sensorStatus').textContent =
+        status.sensorOk
+          ? (status.heaterActive ? 'OK / heater purge' : 'Found / OK')
+          : 'Not found';
 
       document.getElementById('loggingStatus').textContent =
         status.loggingEnabled
@@ -684,6 +838,31 @@ void handleRoot() {
       document.getElementById('heapStatus').textContent = `${freeKb} kB (max block ${largestKb} kB)`;
 
       document.getElementById('resetReason').textContent = status.bootResetReason;
+
+      document.getElementById('logFile').textContent =
+        status.sdOk
+          ? (status.logFileExists
+              ? `${status.logFileName} (${(status.logFileSize / 1024).toFixed(1)} kB)`
+              : `${status.logFileName} (missing)`)
+          : 'No card';
+
+      document.getElementById('sdSpace').textContent =
+        status.sdOk ? `${status.sdFreeMb} MB free of ${status.sdTotalMb} MB` : 'No card';
+
+      document.getElementById('siteIdView').textContent = status.siteId || 'Not set';
+
+      document.getElementById('rtcTemp').textContent =
+        status.rtcOk ? `${status.rtcTemperatureC.toFixed(2)} C` : '--';
+
+      // Populate the config form once, so typing is not overwritten by polling.
+      if (!configLoaded) {
+        configLoaded = true;
+        document.getElementById('cfgSiteId').value = status.siteId;
+        document.getElementById('cfgTempOffset').value = status.tempOffsetC;
+        document.getElementById('cfgHumOffset').value = status.humidityOffset;
+        document.getElementById('cfgDailyRotate').checked = status.dailyRotate;
+        document.getElementById('cfgHeater').checked = status.heaterEnabled;
+      }
 
       const log = await fetch('/api/log').then(r => r.json());
 
@@ -730,6 +909,33 @@ void handleRoot() {
       refresh();
     }
 
+    async function saveConfig() {
+      const params = new URLSearchParams({
+        siteId: document.getElementById('cfgSiteId').value,
+        tempOffsetC: document.getElementById('cfgTempOffset').value || '0',
+        humidityOffset: document.getElementById('cfgHumOffset').value || '0',
+        dailyRotate: document.getElementById('cfgDailyRotate').checked ? 'true' : 'false',
+        heaterEnabled: document.getElementById('cfgHeater').checked ? 'true' : 'false'
+      });
+
+      const response = await fetch('/api/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: params
+      });
+
+      document.getElementById('message').textContent = await response.text();
+      refresh();
+    }
+
+    async function newLogFile() {
+      if (!confirm('Archive the current log file and start a new one?')) return;
+
+      const response = await fetch('/api/logfile/new', { method: 'POST' });
+      document.getElementById('message').textContent = await response.text();
+      refresh();
+    }
+
     refresh();
     setInterval(refresh, 5000);
   </script>
@@ -768,6 +974,7 @@ void handleLogJson() {
     json += "\"avgHumidity\":" + String(logRows[index].avgHumidity, 2) + ",";
     json += "\"minHumidity\":" + String(logRows[index].minHumidity, 2) + ",";
     json += "\"maxHumidity\":" + String(logRows[index].maxHumidity, 2) + ",";
+    json += "\"rtcTemperatureC\":" + String(logRows[index].rtcTemperatureC, 2) + ",";
     json += "\"sampleCount\":" + String(logRows[index].sampleCount);
     json += "}";
   }
@@ -808,6 +1015,8 @@ void handleLogCsv() {
     row += ",";
     row += String(logRows[index].utcOffsetMinutes);
     row += ",";
+    row += csvEscape(siteId);
+    row += ",";
     row += String(logRows[index].avgTemperatureC, 2);
     row += ",";
     row += String(logRows[index].minTemperatureC, 2);
@@ -819,6 +1028,8 @@ void handleLogCsv() {
     row += String(logRows[index].minHumidity, 2);
     row += ",";
     row += String(logRows[index].maxHumidity, 2);
+    row += ",";
+    row += String(logRows[index].rtcTemperatureC, 2);
     row += ",";
     row += String(logRows[index].sampleCount);
     row += "\n";
@@ -844,6 +1055,83 @@ void handleEventCsv() {
   String csv = String(EVENT_CSV_HEADER) + "\n";
   server.sendHeader("Content-Disposition", "attachment; filename=logger-events.csv");
   server.send(200, "text/csv", csv);
+}
+
+String buildArchiveName() {
+  if (rtcOk) {
+    DateTime now = rtc.now();
+    return "/temp_humidity_1min_" + String(now.year()) +
+           twoDigits(now.month()) + twoDigits(now.day()) + "_" +
+           twoDigits(now.hour()) + twoDigits(now.minute()) +
+           twoDigits(now.second()) + ".csv";
+  }
+
+  // No trustworthy clock: fall back to the first free numbered name.
+  for (int i = 1; i < 1000; i++) {
+    String candidate = "/temp_humidity_1min_old" + String(i) + ".csv";
+    if (!SD.exists(candidate)) return candidate;
+  }
+  return "";
+}
+
+// Archives the current log file (if any) under a timestamped name and starts a
+// fresh one at the fixed LOG_FILENAME with the current header. Clears the RAM
+// ring buffer so the webpage table matches the new file. Deliberately does NOT
+// touch the in-progress minute aggregate — callers decide that. Used by the
+// web control, the optional daily rotation, and the boot-time schema check.
+bool rotateLogFile(String &archiveNameOut) {
+  archiveNameOut = "";
+  if (!sdOk) return false;
+
+  if (SD.exists(LOG_FILENAME)) {
+    String archiveName = buildArchiveName();
+    if (archiveName.length() == 0 || !SD.rename(LOG_FILENAME, archiveName)) {
+      appendEventLog("sd_error", "log_rotate_failed", "could not archive current log file");
+      return false;
+    }
+    archiveNameOut = archiveName;
+  }
+
+  File file = SD.open(LOG_FILENAME, FILE_WRITE);
+  if (!file) {
+    sdOk = false;
+    return false;
+  }
+  file.println(LOG_CSV_HEADER);
+  file.close();
+
+  logCount = 0;
+  logWriteIndex = 0;
+  return true;
+}
+
+void handleNewLogFile() {
+  if (!sdOk) {
+    server.send(503, "text/plain", "No SD card; cannot start a new log file.");
+    return;
+  }
+
+  String archiveName;
+  if (!rotateLogFile(archiveName)) {
+    server.send(500, "text/plain", "Could not start a new log file.");
+    return;
+  }
+
+  // Discard the partial minute so the new file starts clean.
+  resetAggregate();
+  lastLogMillis = millis();
+
+  appendEventLog(
+    "log_file_rotated",
+    "web_command",
+    archiveName.length() > 0 ? ("previous file archived as " + archiveName)
+                             : String("new log file started; no previous file")
+  );
+
+  server.send(200, "text/plain",
+              archiveName.length() > 0
+                ? ("New log file started. Previous file archived as " + archiveName)
+                : String("New log file started."));
 }
 
 bool argInRange(const String &name, int minValue, int maxValue) {
@@ -882,7 +1170,24 @@ void handleSyncRtc() {
     server.arg("second").toInt()
   );
 
+  // Clock-drift measurement: compare the RTC to the browser before adjusting.
+  // Positive drift = the RTC was behind. Together with the time since the last
+  // sync this characterizes each unit's drift rate.
+  long driftSeconds = 0;
+  bool driftKnown = false;
+  DateTime rtcBefore = rtc.now();
+  if (!rtcBatteryConcern && rtcBefore.year() >= 2020) {
+    driftSeconds = (long)browserTime.unixtime() - (long)rtcBefore.unixtime();
+    driftKnown = true;
+  }
+
+  uint32_t secondsSinceLastSync = 0;
+  if (rtcLastSyncUnix > 0 && browserTime.unixtime() > rtcLastSyncUnix) {
+    secondsSinceLastSync = browserTime.unixtime() - rtcLastSyncUnix;
+  }
+
   rtc.adjust(browserTime);
+  rtcLastSyncUnix = browserTime.unixtime();
 
   rtcSyncTimezone = server.arg("timezone");
   rtcSyncUtcOffsetMinutes = server.arg("utcOffsetMinutes").toInt();
@@ -901,10 +1206,55 @@ void handleSyncRtc() {
   appendEventLog(
     "rtc_sync",
     "web_command",
-    "RTC synced from browser device using timezone " + rtcSyncTimezone
+    "RTC synced from browser device using timezone " + rtcSyncTimezone +
+    ", driftSeconds=" + (driftKnown ? String(driftSeconds) : String("unknown")) +
+    ", secondsSinceLastSync=" +
+    (secondsSinceLastSync > 0 ? String(secondsSinceLastSync) : String("unknown"))
   );
 
   server.send(200, "text/plain", "RTC synced to this device: " + formatDateTime(browserTime));
+}
+
+void handleSetConfig() {
+  if (server.hasArg("siteId")) {
+    siteId = server.arg("siteId");
+    siteId.trim();
+    siteId.replace("\"", "");   // keep the status JSON well-formed
+    siteId.replace("\\", "");
+    if (siteId.length() > 32) siteId = siteId.substring(0, 32);
+  }
+
+  if (server.hasArg("tempOffsetC")) {
+    tempOffsetC = constrain(server.arg("tempOffsetC").toFloat(), -10.0f, 10.0f);
+  }
+
+  if (server.hasArg("humidityOffset")) {
+    humidityOffset = constrain(server.arg("humidityOffset").toFloat(), -20.0f, 20.0f);
+  }
+
+  if (server.hasArg("dailyRotate")) {
+    dailyRotateEnabled = server.arg("dailyRotate") == "true";
+  }
+
+  if (server.hasArg("heaterEnabled")) {
+    sensorHeaterEnabled = server.arg("heaterEnabled") == "true";
+  }
+
+  saveLoggingConfig();
+
+  // Config changes are provenance: calibration offsets in particular must be
+  // traceable, since they are applied to the values before logging.
+  appendEventLog(
+    "config_changed",
+    "web_command",
+    String("siteId=") + siteId +
+    ", tempOffsetC=" + String(tempOffsetC, 2) +
+    ", humidityOffset=" + String(humidityOffset, 1) +
+    ", dailyRotate=" + (dailyRotateEnabled ? "true" : "false") +
+    ", heater=" + (sensorHeaterEnabled ? "true" : "false")
+  );
+
+  server.send(200, "text/plain", "Configuration saved.");
 }
 
 // -------- Setup helpers --------
@@ -917,9 +1267,32 @@ void setupRoutes() {
   server.on("/api/sync", HTTP_POST, handleSyncRtc);
   server.on("/api/logging/start", HTTP_POST, handleStartLogging);
   server.on("/api/logging/stop", HTTP_POST, handleStopLogging);
+  server.on("/api/logfile/new", HTTP_POST, handleNewLogFile);
+  server.on("/api/config", HTTP_POST, handleSetConfig);
 
   // In the NimBLE variant, server.begin() is called only when Wi-Fi is enabled
   // inside WifiControl.cpp.
+}
+
+// If the existing log file was written with an older column layout, appending
+// new-format rows would misalign the columns. Archive it and start fresh.
+void verifyLogFileSchema() {
+  if (!sdOk || !SD.exists(LOG_FILENAME)) return;
+
+  File file = SD.open(LOG_FILENAME, FILE_READ);
+  if (!file) return;
+  String firstLine = file.readStringUntil('\n');
+  file.close();
+  firstLine.trim();
+
+  if (firstLine == String(LOG_CSV_HEADER)) return;
+
+  String archiveName;
+  if (rotateLogFile(archiveName)) {
+    Serial.println("Log file schema changed; archived old-format file.");
+    appendEventLog("log_file_rotated", "schema_changed",
+                   "old-format file archived as " + archiveName);
+  }
 }
 
 void setupSdCard() {
@@ -945,6 +1318,70 @@ void setupSdCard() {
     } else {
       Serial.println("Could not create event log file.");
     }
+  }
+
+  verifyLogFileSchema();
+}
+
+// Self-heal for the SD card, in the same spirit as ensureBleAdvertising():
+// sdOk latches false on any failure, so without this only a reboot recovers
+// from a flaky card seat or a card swapped in the field.
+void ensureSdCard() {
+  static unsigned long lastAttemptMillis = 0;
+
+  if (sdOk) return;
+  if (millis() - lastAttemptMillis < 30000) return;
+  lastAttemptMillis = millis();
+
+  SD.end();
+  setupSdCard();
+
+  if (sdOk) {
+    Serial.println("microSD card remounted.");
+    appendEventLog("sd_remounted", "auto_remount", "microSD card available again");
+  }
+}
+
+// SHT-30 heater state machine: every HEATER_PERIOD_MS, heat for HEATER_ON_MS,
+// then wait HEATER_SETTLE_MS before sampling resumes (sampleSensor() skips
+// readings while heaterOn or heaterSettling).
+void manageSensorHeater() {
+  if (!sensorOk) return;
+
+  if (!sensorHeaterEnabled) {
+    if (heaterOn || heaterSettling) {
+      sht31.heater(false);
+      heaterOn = false;
+      heaterSettling = false;
+      heaterLastCycleEndMillis = millis();
+    }
+    return;
+  }
+
+  if (heaterOn) {
+    if (millis() - heaterOnStartMillis >= HEATER_ON_MS) {
+      sht31.heater(false);
+      heaterOn = false;
+      heaterSettling = true;
+      heaterSettleStartMillis = millis();
+      Serial.println("SHT-30 heater off; settling before sampling resumes.");
+    }
+    return;
+  }
+
+  if (heaterSettling) {
+    if (millis() - heaterSettleStartMillis >= HEATER_SETTLE_MS) {
+      heaterSettling = false;
+      heaterLastCycleEndMillis = millis();
+    }
+    return;
+  }
+
+  if (millis() - heaterLastCycleEndMillis >= HEATER_PERIOD_MS) {
+    sht31.heater(true);
+    heaterOn = true;
+    heaterOnStartMillis = millis();
+    Serial.println("SHT-30 heater on (condensation purge).");
   }
 }
 
@@ -1098,6 +1535,8 @@ void loop() {
 
   checkWifiAutoOff();
   ensureBleAdvertising();
+  ensureSdCard();
+  manageSensorHeater();
   checkScheduledReboot();
 
   esp_task_wdt_reset(); // reset the dog
