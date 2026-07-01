@@ -8,6 +8,12 @@
 static NimBLEServer *bleServer = nullptr;
 static NimBLECharacteristic *bleCommandCharacteristic = nullptr;
 
+// Idle-kick: a phone that connects and then goes silent (BLE app backgrounded)
+// holds the connection and stops advertising, making the device invisible to
+// every other scanner. Track last activity and drop clients that exceed this.
+static const unsigned long BLE_IDLE_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+static volatile unsigned long lastBleActivityMillis = 0;
+
 // Single-slot mailbox for a command received over BLE. The NimBLE callback
 // runs on the NimBLE host task; loop() drains it on the main Arduino task.
 // A critical section guards the shared String against concurrent access.
@@ -17,6 +23,7 @@ static volatile bool bleCommandPending = false;
 
 class BleServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
+    lastBleActivityMillis = millis();
     Serial.println("BLE client connected.");
   }
 
@@ -38,6 +45,8 @@ class BleCommandCallbacks : public NimBLECharacteristicCallbacks {
     String command = String(value.c_str());
     command.trim();
     command.toUpperCase();
+
+    lastBleActivityMillis = millis();
 
     // Do the minimum here: stash the command and return. All Wi-Fi/SD/I2C work
     // happens later in loop() so it never runs on the NimBLE host task.
@@ -112,7 +121,23 @@ void ensureBleAdvertising() {
   lastCheckMillis = millis();
 
   if (bleServer == nullptr) return;
-  if (bleServer->getConnectedCount() > 0) return;
+
+  uint8_t connectedCount = bleServer->getConnectedCount();
+  if (connectedCount > 0) {
+    // Idle-kick: drop clients that have been silent too long so the device
+    // goes back to advertising. onDisconnect restarts advertising for us.
+    if (millis() - lastBleActivityMillis >= BLE_IDLE_TIMEOUT_MS) {
+      Serial.println("BLE client idle too long; disconnecting to resume advertising.");
+
+      for (uint8_t i = 0; i < connectedCount; i++) {
+        bleServer->disconnect(bleServer->getPeerInfo(i).getConnHandle());
+      }
+
+      lastBleActivityMillis = millis();  // don't re-kick while teardown completes
+    }
+
+    return;
+  }
 
   NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
   if (advertising->isAdvertising()) return;
