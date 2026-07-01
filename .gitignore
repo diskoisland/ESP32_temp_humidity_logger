@@ -11,19 +11,11 @@ build/
 # macOS
 .DS_Store
 
-# Local secrets
-Secrets.h
-
 # Editor files
 .vscode/
 .idea/
 
-# Local secrets, both common case variants
-Secrets.h
-secrets.h
-
-# Local secrets files
-Secrets.h
-secrets.h
+# Local secrets (keep the example template tracked)
 Secrets*.h
 secrets*.h
+!Secrets.example.h
