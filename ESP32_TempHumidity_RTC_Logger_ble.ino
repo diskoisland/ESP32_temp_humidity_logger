@@ -1097,6 +1097,7 @@ void loop() {
   }
 
   checkWifiAutoOff();
+  ensureBleAdvertising();
   checkScheduledReboot();
 
   esp_task_wdt_reset(); // reset the dog

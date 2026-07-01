@@ -12,4 +12,9 @@ void sendBleResponse(const String &response);
 // Wi-Fi / SD / I2C work stays on a single task.
 bool takeBleCommand(String &commandOut);
 
+// Called from loop(). Restarts BLE advertising if it has stopped while no
+// client is connected (unclean disconnect, coexistence hiccup), so the device
+// never needs a reboot to become discoverable again.
+void ensureBleAdvertising();
+
 #endif

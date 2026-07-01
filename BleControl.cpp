@@ -5,6 +5,7 @@
 #define BLE_SERVICE_UUID        "8b7e0001-7a1b-4c2d-9f5e-123456789abc"
 #define BLE_COMMAND_CHAR_UUID   "8b7e0002-7a1b-4c2d-9f5e-123456789abc"
 
+static NimBLEServer *bleServer = nullptr;
 static NimBLECharacteristic *bleCommandCharacteristic = nullptr;
 
 // Single-slot mailbox for a command received over BLE. The NimBLE callback
@@ -13,6 +14,22 @@ static NimBLECharacteristic *bleCommandCharacteristic = nullptr;
 static portMUX_TYPE bleCommandMux = portMUX_INITIALIZER_UNLOCKED;
 static String pendingBleCommand;
 static volatile bool bleCommandPending = false;
+
+class BleServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
+    Serial.println("BLE client connected.");
+  }
+
+  void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
+    // Reason 8 (0x08) = supervision timeout, i.e. the client vanished without
+    // a clean disconnect (out of range, app killed). Advertising must be
+    // restarted explicitly or the device stays invisible until reboot.
+    Serial.print("BLE client disconnected, reason ");
+    Serial.println(reason);
+
+    NimBLEDevice::getAdvertising()->start();
+  }
+};
 
 class BleCommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
@@ -58,7 +75,10 @@ void sendBleResponse(const String &response) {
 void startBle(const char *deviceName) {
   NimBLEDevice::init(deviceName);
 
-  NimBLEServer *bleServer = NimBLEDevice::createServer();
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new BleServerCallbacks());
+  bleServer->advertiseOnDisconnect(true);
+
   NimBLEService *service = bleServer->createService(BLE_SERVICE_UUID);
 
   bleCommandCharacteristic = service->createCharacteristic(
@@ -80,4 +100,26 @@ void startBle(const char *deviceName) {
 
   Serial.print("NimBLE started. Device name: ");
   Serial.println(deviceName);
+}
+
+void ensureBleAdvertising() {
+  // Self-heal: if no client is connected but advertising has stopped (unclean
+  // disconnect, Wi-Fi/BLE coexistence hiccup), restart it. Checked on a slow
+  // cadence from loop() so a stalled radio never requires a reboot.
+  static unsigned long lastCheckMillis = 0;
+
+  if (millis() - lastCheckMillis < 5000) return;
+  lastCheckMillis = millis();
+
+  if (bleServer == nullptr) return;
+  if (bleServer->getConnectedCount() > 0) return;
+
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  if (advertising->isAdvertising()) return;
+
+  if (advertising->start()) {
+    Serial.println("BLE advertising restarted by watchdog check.");
+  } else {
+    Serial.println("BLE advertising restart failed; will retry.");
+  }
 }
