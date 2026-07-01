@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SHT30 Logger BLE Control</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body {
+      margin: 0;
+      background: #f5f7f8;
+      color: #172026;
+    }
+
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+    }
+
+    p {
+      line-height: 1.45;
+    }
+
+    .card {
+      background: white;
+      border: 1px solid #d7dee2;
+      border-radius: 10px;
+      padding: 16px;
+      margin: 14px 0;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+
+    .status-box {
+      background: #eef3f5;
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    .label {
+      color: #52616b;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+
+    .value {
+      font-size: 17px;
+      font-weight: 700;
+      word-break: break-word;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: #146c94;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.05s ease, background 0.2s ease;
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    button:disabled {
+      background: #8aa0aa;
+      cursor: not-allowed;
+    }
+
+    button.danger {
+      background: #9b2c2c;
+    }
+
+    button.good {
+      background: #238636;
+    }
+
+    code {
+      background: #eef3f5;
+      padding: 2px 5px;
+      border-radius: 5px;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #11181d;
+      color: #e9f2f5;
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 160px;
+      overflow-y: auto;
+    }
+
+    .small {
+      color: #52616b;
+      font-size: 14px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      body {
+        background: #11181d;
+        color: #edf4f7;
+      }
+
+      .card {
+        background: #172026;
+        border-color: #31414b;
+      }
+
+      .status-box {
+        background: #22303a;
+      }
+
+      .label,
+      .small {
+        color: #aab8c0;
+      }
+
+      code {
+        background: #22303a;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>SHT30 Logger BLE Control</h1>
+    <p>
+      Use this page to connect to the ESP32 logger over Bluetooth LE and send
+      <code>STATUS</code>, <code>WIFI_ON</code>, and <code>WIFI_OFF</code> commands.
+    </p>
+
+    <div class="card">
+      <div class="status-grid">
+        <div class="status-box">
+          <div class="label">Browser Bluetooth</div>
+          <div id="browserStatus" class="value">Checking...</div>
+        </div>
+        <div class="status-box">
+          <div class="label">BLE connection</div>
+          <div id="connectionStatus" class="value">Disconnected</div>
+        </div>
+        <div class="status-box">
+          <div class="label">Device</div>
+          <div id="deviceName" class="value">None</div>
+        </div>
+        <div class="status-box">
+          <div class="label">Last response</div>
+          <div id="lastResponse" class="value">None</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="connectButton" onclick="connectBle()">Connect BLE</button>
+        <button id="disconnectButton" class="danger" onclick="disconnectBle()" disabled>Disconnect</button>
+      </div>
+
+      <p class="small">
+        Works in browsers with Web Bluetooth support, such as Chrome or Edge.
+        Safari and Firefox generally do not support Web Bluetooth.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Logger commands</h2>
+      <div class="row">
+        <button id="statusButton" onclick="sendCommand('STATUS')" disabled>STATUS</button>
+        <button id="wifiOnButton" class="good" onclick="sendCommand('WIFI_ON')" disabled>WIFI_ON</button>
+        <button id="wifiOffButton" class="danger" onclick="sendCommand('WIFI_OFF')" disabled>WIFI_OFF</button>
+      </div>
+
+      <p class="small">
+        After <code>WIFI_ON</code>, connect your phone or laptop to the logger Wi-Fi AP
+        and open <code>http://192.168.4.1</code>.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Command log</h2>
+      <pre id="log"></pre>
+      <div class="row">
+        <button onclick="clearLog()">Clear log</button>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const SERVICE_UUID = '8b7e0001-7a1b-4c2d-9f5e-123456789abc';
+    const COMMAND_CHAR_UUID = '8b7e0002-7a1b-4c2d-9f5e-123456789abc';
+
+    let bleDevice = null;
+    let commandCharacteristic = null;
+
+    const browserStatus = document.getElementById('browserStatus');
+    const connectionStatus = document.getElementById('connectionStatus');
+    const deviceName = document.getElementById('deviceName');
+    const lastResponse = document.getElementById('lastResponse');
+    const logBox = document.getElementById('log');
+
+    const connectButton = document.getElementById('connectButton');
+    const disconnectButton = document.getElementById('disconnectButton');
+    const statusButton = document.getElementById('statusButton');
+    const wifiOnButton = document.getElementById('wifiOnButton');
+    const wifiOffButton = document.getElementById('wifiOffButton');
+
+    function log(message) {
+      const timestamp = new Date().toLocaleTimeString();
+      logBox.textContent += `[${timestamp}] ${message}\n`;
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function clearLog() {
+      logBox.textContent = '';
+    }
+
+    function setConnectedUi(connected) {
+      connectionStatus.textContent = connected ? 'Connected' : 'Disconnected';
+      connectButton.disabled = connected;
+      disconnectButton.disabled = !connected;
+      statusButton.disabled = !connected;
+      wifiOnButton.disabled = !connected;
+      wifiOffButton.disabled = !connected;
+
+      if (!connected) {
+        commandCharacteristic = null;
+      }
+    }
+
+    async function checkBrowserBluetooth() {
+      if (!navigator.bluetooth) {
+        browserStatus.textContent = 'Not supported';
+        log('Web Bluetooth is not supported in this browser.');
+        return;
+      }
+
+      try {
+        const available = await navigator.bluetooth.getAvailability();
+        browserStatus.textContent = available ? 'Available' : 'Unavailable';
+        log(`Browser Bluetooth availability: ${available}`);
+      } catch (error) {
+        browserStatus.textContent = 'Supported';
+        log(`Bluetooth availability check skipped: ${error.message}`);
+      }
+    }
+
+    function handleDisconnect() {
+      log('BLE device disconnected.');
+      setConnectedUi(false);
+      deviceName.textContent = 'None';
+    }
+
+    async function connectBle() {
+      if (!navigator.bluetooth) {
+        alert('Web Bluetooth is not supported in this browser. Try Chrome or Edge.');
+        return;
+      }
+
+      try {
+        log('Requesting BLE device...');
+
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [
+            { name: 'SHT30-Logger' },
+            { services: [SERVICE_UUID] }
+          ],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        bleDevice.addEventListener('gattserverdisconnected', handleDisconnect);
+
+        deviceName.textContent = bleDevice.name || 'Unnamed device';
+        log(`Selected device: ${deviceName.textContent}`);
+
+        log('Connecting to GATT server...');
+        const server = await bleDevice.gatt.connect();
+
+        log('Getting BLE service...');
+        const service = await server.getPrimaryService(SERVICE_UUID);
+
+        log('Getting command characteristic...');
+        commandCharacteristic = await service.getCharacteristic(COMMAND_CHAR_UUID);
+
+        log('Starting notifications...');
+        await commandCharacteristic.startNotifications();
+        commandCharacteristic.addEventListener('characteristicvaluechanged', handleNotification);
+
+        setConnectedUi(true);
+        log('BLE connected and ready.');
+
+        await sendCommand('STATUS');
+      } catch (error) {
+        log(`Connection failed: ${error.message}`);
+        setConnectedUi(false);
+      }
+    }
+
+    function disconnectBle() {
+      if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+      } else {
+        handleDisconnect();
+      }
+    }
+
+    function handleNotification(event) {
+      const value = event.target.value;
+      const decoder = new TextDecoder('utf-8');
+      const response = decoder.decode(value);
+
+      lastResponse.textContent = response;
+      log(`RX: ${response}`);
+    }
+
+    async function sendCommand(command) {
+      if (!commandCharacteristic) {
+        log('Cannot send command: not connected.');
+        return;
+      }
+
+      try {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(command);
+
+        log(`TX: ${command}`);
+        await commandCharacteristic.writeValue(data);
+      } catch (error) {
+        log(`Command failed: ${error.message}`);
+      }
+    }
+
+    checkBrowserBluetooth();
+  </script>
+</body>
+</html>
