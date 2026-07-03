@@ -18,6 +18,8 @@
   BLE commands:
     - WIFI_ON
     - WIFI_OFF
+    - LOG_ON
+    - LOG_OFF
     - STATUS
 
   Open the serial monitor at 115200 baud after uploading.
@@ -155,6 +157,8 @@ void processBleCommand(const String &command);
 String bleStatusText();
 void appendEventLog(const char *event, const char *reason, const String &details);
 void handleEventCsv();
+bool startLogging(const char *source);
+void stopLogging(const char *source);
 
 // -------- Helper functions --------
 String twoDigits(int value) {
@@ -186,6 +190,24 @@ String csvEscape(const String &value) {
   return escaped;
 }
 
+// A transient I2C glitch can make rtc.now() return garbage (a real example
+// from the field: month 83, day 165, hour 45 — while the SHT-30 on the same
+// bus returned NaN). Read with validation and one retry so a corrupt
+// timestamp never enters the logs.
+bool readRtcTime(DateTime &out) {
+  if (!rtcOk) return false;
+
+  for (int attempt = 0; attempt < 2; attempt++) {
+    DateTime t = rtc.now();
+    if (t.isValid() && t.year() >= 2020 && t.year() <= 2099) {
+      out = t;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void appendEventLog(const char *event, const char *reason, const String &details) {
   Serial.print("Event: ");
   Serial.print(event);
@@ -195,8 +217,15 @@ void appendEventLog(const char *event, const char *reason, const String &details
   Serial.println(details);
 
   // Event rows need a reliable timestamp. If the SD card or RTC is missing,
-  // the event is still printed to Serial but not written to the event CSV.
+  // or the RTC returns an invalid time, the event is still printed to Serial
+  // but not written to the event CSV.
   if (!sdOk || !rtcOk) return;
+
+  DateTime now;
+  if (!readRtcTime(now)) {
+    Serial.println("Event not written to CSV: RTC returned an invalid timestamp.");
+    return;
+  }
 
   File file = SD.open(EVENT_LOG_FILENAME, FILE_APPEND);
   if (!file) {
@@ -208,8 +237,6 @@ void appendEventLog(const char *event, const char *reason, const String &details
   if (file.size() == 0) {
     file.println(EVENT_CSV_HEADER);
   }
-
-  DateTime now = rtc.now();
 
   file.print(csvDateTime(now));
   file.print(",");
@@ -269,6 +296,21 @@ void processBleCommand(const String &command) {
     return;
   }
 
+  if (command == "LOG_ON") {
+    if (startLogging("ble_command")) {
+      sendBleResponse("OK LOG_ON logging=on");
+    } else {
+      sendBleResponse("ERROR LOG_ON blocked: sync RTC and confirm it is valid first");
+    }
+    return;
+  }
+
+  if (command == "LOG_OFF") {
+    stopLogging("ble_command");
+    sendBleResponse("OK LOG_OFF logging=off");
+    return;
+  }
+
   if (command == "STATUS") {
     appendEventLog("status", "ble_command", "STATUS");
     sendBleResponse(bleStatusText());
@@ -276,7 +318,7 @@ void processBleCommand(const String &command) {
   }
 
   appendEventLog("unknown_ble_command", "ble_command", command);
-  sendBleResponse("ERROR Unknown command. Use WIFI_ON, WIFI_OFF, or STATUS.");
+  sendBleResponse("ERROR Unknown command. Use WIFI_ON, WIFI_OFF, LOG_ON, LOG_OFF, or STATUS.");
 }
 
 // -------- Watchdog --------
@@ -374,7 +416,8 @@ void sampleSensor() {
 
   latestTemperatureC = temperatureC;
   latestHumidity = humidity;
-  if (rtcOk) latestTimestamp = rtc.now();
+  DateTime sampleTime;
+  if (readRtcTime(sampleTime)) latestTimestamp = sampleTime;  // else keep previous
   latestValid = true;
 
   if (loggingEnabled && rtcOk) {
@@ -415,7 +458,14 @@ void logAggregate() {
 
   if (!rtcOk || aggregateSampleCount == 0) return;
 
-  DateTime now = rtc.now();
+  // Bad RTC read: keep accumulating and try again next interval, so the next
+  // row is a longer average rather than one with a corrupt timestamp.
+  DateTime now;
+  if (!readRtcTime(now)) {
+    Serial.println("Log row deferred: RTC returned an invalid timestamp.");
+    return;
+  }
+
   float avgTemperatureC = sumTemperatureC / aggregateSampleCount;
   float avgHumidity = sumHumidity / aggregateSampleCount;
   float rtcTemperatureNow = rtc.getTemperature();  // DS3231 die = enclosure temp
@@ -502,16 +552,17 @@ void logAggregate() {
 }
 
 // -------- Web handlers --------
-void handleStartLogging() {
+// Shared start/stop logic so the web page and BLE both enforce the same RTC
+// gating. `source` is recorded in the event log (e.g. "web_command",
+// "ble_command"). startLogging returns false if the RTC precondition fails.
+bool startLogging(const char *source) {
   if (!rtcOk || !rtcWasSynced || rtcBatteryConcern) {
     appendEventLog(
       "logging_blocked",
-      "web_command",
+      source,
       "start requested but RTC was not synced, invalid, or battery concern was active"
     );
-
-    server.send(400, "text/plain", "Sync RTC and confirm RTC is valid before starting logging.");
-    return;
+    return false;
   }
 
   loggingEnabled = true;
@@ -520,27 +571,36 @@ void handleStartLogging() {
   lastLogMillis = millis();
 
   saveLoggingConfig();
-
-  appendEventLog("logging_start", "web_command", "user pressed Start logging");
-
-  server.send(200, "text/plain", "Logging started.");
+  appendEventLog("logging_start", source, "logging started");
+  return true;
 }
 
-void handleStopLogging() {
+void stopLogging(const char *source) {
   loggingEnabled = false;
   autoLoggingWanted = false;
   rebootPending = false;
   resetAggregate();
 
   saveLoggingConfig();
+  appendEventLog("logging_stop", source, "logging stopped");
+}
 
-  appendEventLog("logging_stop", "web_command", "user pressed Stop logging");
+void handleStartLogging() {
+  if (startLogging("web_command")) {
+    server.send(200, "text/plain", "Logging started.");
+  } else {
+    server.send(400, "text/plain", "Sync RTC and confirm RTC is valid before starting logging.");
+  }
+}
 
+void handleStopLogging() {
+  stopLogging("web_command");
   server.send(200, "text/plain", "Logging stopped.");
 }
 
 String statusJson() {
-  DateTime now = rtcOk ? rtc.now() : DateTime(2000, 1, 1, 0, 0, 0);
+  DateTime now;
+  bool rtcReadOk = readRtcTime(now);
 
   // Heap health. largestFreeBlock / freeHeap is the fragmentation indicator:
   // when free heap stays high but the largest block shrinks, the heap is
@@ -609,7 +669,8 @@ String statusJson() {
   json += ",\"rebootPending\":";
   json += rebootPending ? "true" : "false";
   json += ",\"rtcTime\":\"";
-  json += rtcOk ? formatDateTime(now) : String("RTC not found");
+  json += rtcReadOk ? formatDateTime(now)
+                    : String(rtcOk ? "RTC read error" : "RTC not found");
   json += "\",\"latestValid\":";
   json += latestValid ? "true" : "false";
   json += ",\"temperatureC\":";
@@ -710,9 +771,10 @@ void handleRoot() {
     #message { min-height: 24px; color: #146c94; font-weight: 700; }
 
     .config label { display: flex; align-items: center; gap: 6px; font-size: 14px; }
-    .config input[type="text"], .config input[type="number"] {
+    .config input[type="text"], .config input[type="number"],
+    .config input[type="date"], .config select {
       padding: 8px; border: 1px solid #d7dee2; border-radius: 6px;
-      background: inherit; color: inherit; max-width: 130px;
+      background: inherit; color: inherit; max-width: 160px;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -781,6 +843,29 @@ void handleRoot() {
       </thead>
       <tbody id="rows"></tbody>
     </table>
+
+    <div class="card config">
+      <div class="label">Files on SD card</div>
+      <div class="row">
+        <label>Type
+          <select id="fileType" onchange="renderFiles()">
+            <option value="all">All</option>
+            <option value="sensor">Sensor</option>
+            <option value="events">Events</option>
+          </select>
+        </label>
+        <label>From <input id="fileFrom" type="date" onchange="renderFiles()"></label>
+        <label>To <input id="fileTo" type="date" onchange="renderFiles()"></label>
+        <button onclick="flashButton(this); refreshFiles()">Refresh list</button>
+        <button onclick="flashButton(this); downloadMerged()">Download merged</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th><input id="fileCheckAll" type="checkbox" onchange="toggleAllFiles(this)"></th><th>File</th><th>Type</th><th>Date</th><th>Size</th><th></th></tr>
+        </thead>
+        <tbody id="fileRows"></tbody>
+      </table>
+    </div>
   </main>
 
   <script>
@@ -934,9 +1019,103 @@ void handleRoot() {
       const response = await fetch('/api/logfile/new', { method: 'POST' });
       document.getElementById('message').textContent = await response.text();
       refresh();
+      refreshFiles();
+    }
+
+    let allFiles = [];
+
+    // Fetched on demand (page load, Refresh button, after rotation) rather than
+    // on the 5 s poll, so we don't scan the SD directory every refresh.
+    async function refreshFiles() {
+      try {
+        const data = await fetch('/api/files').then(r => r.json());
+        allFiles = data.files || [];
+        renderFiles();
+      } catch (e) {
+        document.getElementById('fileRows').innerHTML =
+          '<tr><td colspan="6">Could not load file list.</td></tr>';
+      }
+    }
+
+    // Client-side date-range filter. Files without an embedded date (the live
+    // log, the event log, numbered fallbacks) always show.
+    function renderFiles() {
+      const type = document.getElementById('fileType').value;
+      const from = document.getElementById('fileFrom').value;
+      const to = document.getElementById('fileTo').value;
+
+      const rows = allFiles.filter(f => {
+        if (type !== 'all' && f.type !== type) return false;
+        if (!f.date) return true;
+        if (from && f.date < from) return false;
+        if (to && f.date > to) return false;
+        return true;
+      }).sort((a, b) =>
+        (b.date || '').localeCompare(a.date || '') || a.name.localeCompare(b.name)
+      );
+
+      document.getElementById('fileCheckAll').checked = false;
+
+      document.getElementById('fileRows').innerHTML = rows.length
+        ? rows.map(f =>
+            `<tr><td><input type="checkbox" class="fileCheck" value="${f.name}" data-type="${f.type}"></td>` +
+            `<td>${f.name}</td><td>${f.type}</td><td>${f.date || '—'}</td>` +
+            `<td>${(f.size / 1024).toFixed(1)} kB</td>` +
+            `<td><a class="button" href="/download?file=${encodeURIComponent(f.name)}">Download</a></td></tr>`
+          ).join('')
+        : '<tr><td colspan="6">No files match.</td></tr>';
+    }
+
+    function toggleAllFiles(master) {
+      document.querySelectorAll('.fileCheck').forEach(c => { c.checked = master.checked; });
+    }
+
+    async function downloadMerged() {
+      const checked = [...document.querySelectorAll('.fileCheck:checked')];
+      if (checked.length === 0) {
+        document.getElementById('message').textContent = 'Select files to merge first.';
+        return;
+      }
+
+      const types = new Set(checked.map(c => c.dataset.type));
+      if (types.size > 1) {
+        document.getElementById('message').textContent =
+          'Select files of a single type (sensor or events) to merge.';
+        return;
+      }
+
+      const names = checked.map(c => c.value);
+      const params = new URLSearchParams({ files: names.join(',') });
+
+      document.getElementById('message').textContent = `Merging ${names.length} files...`;
+
+      const response = await fetch('/download/merged', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: params
+      });
+
+      if (!response.ok) {
+        document.getElementById('message').textContent = 'Merge failed: ' + await response.text();
+        return;
+      }
+
+      // Stream arrives as one CSV; hand it to the browser as a download.
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `merged_${[...types][0]}_${names.length}_files.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+
+      document.getElementById('message').textContent = `Merged ${names.length} files.`;
     }
 
     refresh();
+    refreshFiles();
     setInterval(refresh, 5000);
   </script>
 </body>
@@ -1057,9 +1236,208 @@ void handleEventCsv() {
   server.send(200, "text/csv", csv);
 }
 
+// Whitelist of files the browser lists and the download route will serve: the
+// measurement log and its timestamped archives, plus the event log. Anything
+// else on the card is ignored.
+bool isLogFileName(const String &name) {
+  if (name == "logger_events.csv") return true;
+  return name.startsWith("temp_humidity_1min") && name.endsWith(".csv");
+}
+
+// Category used by the file browser's type filter.
+const char *logFileType(const String &name) {
+  return (name == "logger_events.csv") ? "events" : "sensor";
+}
+
+// Extracts YYYY-MM-DD from an archive name (temp_humidity_1min_YYYYMMDD_...csv).
+// Returns "" for the live file, the event log, and numbered fallbacks, which
+// then always show regardless of the date-range filter.
+String logFileDate(const String &name) {
+  int marker = name.indexOf("1min_");
+  if (marker < 0) return "";
+
+  String rest = name.substring(marker + 5);
+  if (rest.length() < 8) return "";
+  for (int i = 0; i < 8; i++) {
+    if (!isDigit(rest[i])) return "";
+  }
+
+  return rest.substring(0, 4) + "-" + rest.substring(4, 6) + "-" + rest.substring(6, 8);
+}
+
+void handleFilesJson() {
+  String json;
+  json.reserve(4096);
+  json = "{\"files\":[";
+
+  if (sdOk) {
+    File root = SD.open("/");
+    bool first = true;
+
+    if (root && root.isDirectory()) {
+      for (File entry = root.openNextFile(); entry; entry = root.openNextFile()) {
+        if (!entry.isDirectory()) {
+          String name = entry.name();
+          int slash = name.lastIndexOf('/');
+          if (slash >= 0) name = name.substring(slash + 1);  // strip any path
+
+          if (isLogFileName(name)) {
+            if (!first) json += ",";
+            first = false;
+            json += "{\"name\":\"" + name + "\",";
+            json += "\"size\":" + String((uint32_t)entry.size()) + ",";
+            json += "\"type\":\"" + String(logFileType(name)) + "\",";
+            json += "\"date\":\"" + logFileDate(name) + "\"}";
+          }
+        }
+        entry.close();
+        esp_task_wdt_reset();  // dir scans on a full card shouldn't trip the dog
+      }
+      root.close();
+    }
+  }
+
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleDownloadFile() {
+  if (!sdOk) {
+    server.send(503, "text/plain", "No SD card.");
+    return;
+  }
+
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Missing file name.");
+    return;
+  }
+
+  String name = server.arg("file");
+
+  // Reject path traversal and subpaths: only bare names in the SD root are
+  // allowed, and only ones matching the log whitelist.
+  if (name.length() == 0 ||
+      name.indexOf('/') >= 0 ||
+      name.indexOf('\\') >= 0 ||
+      name.indexOf("..") >= 0 ||
+      !isLogFileName(name)) {
+    server.send(400, "text/plain", "Invalid file name.");
+    return;
+  }
+
+  String path = "/" + name;
+  if (!SD.exists(path)) {
+    server.send(404, "text/plain", "File not found.");
+    return;
+  }
+
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    server.send(500, "text/plain", "Could not open file.");
+    return;
+  }
+
+  server.sendHeader("Content-Disposition", "attachment; filename=" + name);
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+
+// Validates one name from a merge selection: bare name, on the whitelist, and
+// present on the card. Returns "" if ok, otherwise an error message.
+String validateMergeName(const String &name) {
+  if (name.length() == 0) return "empty name";
+  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf("..") >= 0) {
+    return "invalid name: " + name;
+  }
+  if (!isLogFileName(name)) return "not a log file: " + name;
+  if (!SD.exists("/" + name)) return "not found: " + name;
+  return "";
+}
+
+// Concatenates several same-type files into one CSV download: the shared header
+// is emitted once, then each file's data rows (its own header line skipped).
+// Streamed chunk by chunk so an arbitrarily large merge needs no big buffer.
+void handleDownloadMerged() {
+  if (!sdOk) {
+    server.send(503, "text/plain", "No SD card.");
+    return;
+  }
+  if (!server.hasArg("files")) {
+    server.send(400, "text/plain", "No files selected.");
+    return;
+  }
+
+  String list = server.arg("files");
+
+  // Pass 1: validate everything and confirm a single common type, before any
+  // response body is sent (so failures can still return an error status).
+  String commonType = "";
+  for (int start = 0; start <= list.length();) {
+    int comma = list.indexOf(',', start);
+    String name = (comma < 0) ? list.substring(start) : list.substring(start, comma);
+    name.trim();
+
+    if (name.length() > 0) {
+      String err = validateMergeName(name);
+      if (err.length() > 0) {
+        server.send(400, "text/plain", "Merge rejected: " + err);
+        return;
+      }
+      String t = logFileType(name);
+      if (commonType.length() == 0) {
+        commonType = t;
+      } else if (commonType != t) {
+        server.send(400, "text/plain", "Selected files must all be the same type.");
+        return;
+      }
+    }
+
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+
+  if (commonType.length() == 0) {
+    server.send(400, "text/plain", "No files selected.");
+    return;
+  }
+
+  server.sendHeader("Content-Disposition", "attachment; filename=merged_" + commonType + ".csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent(String(commonType == "events" ? EVENT_CSV_HEADER : LOG_CSV_HEADER) + "\n");
+
+  // Pass 2: stream each file's rows, skipping its own header line.
+  char buf[513];
+  for (int start = 0; start <= list.length();) {
+    int comma = list.indexOf(',', start);
+    String name = (comma < 0) ? list.substring(start) : list.substring(start, comma);
+    name.trim();
+
+    if (name.length() > 0) {
+      File file = SD.open("/" + name, FILE_READ);
+      if (file) {
+        file.readStringUntil('\n');  // discard the per-file header
+        while (file.available()) {
+          int n = file.read((uint8_t *)buf, sizeof(buf) - 1);
+          if (n <= 0) break;
+          buf[n] = '\0';
+          server.sendContent(buf);
+          esp_task_wdt_reset();  // large merges must not trip the watchdog
+        }
+        file.close();
+      }
+    }
+
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+
+  server.sendContent("");  // terminate the chunked response
+}
+
 String buildArchiveName() {
-  if (rtcOk) {
-    DateTime now = rtc.now();
+  DateTime now;
+  if (readRtcTime(now)) {
     return "/temp_humidity_1min_" + String(now.year()) +
            twoDigits(now.month()) + twoDigits(now.day()) + "_" +
            twoDigits(now.hour()) + twoDigits(now.minute()) +
@@ -1175,8 +1553,8 @@ void handleSyncRtc() {
   // sync this characterizes each unit's drift rate.
   long driftSeconds = 0;
   bool driftKnown = false;
-  DateTime rtcBefore = rtc.now();
-  if (!rtcBatteryConcern && rtcBefore.year() >= 2020) {
+  DateTime rtcBefore;
+  if (!rtcBatteryConcern && readRtcTime(rtcBefore)) {
     driftSeconds = (long)browserTime.unixtime() - (long)rtcBefore.unixtime();
     driftKnown = true;
   }
@@ -1264,6 +1642,9 @@ void setupRoutes() {
   server.on("/api/log", HTTP_GET, handleLogJson);
   server.on("/log.csv", HTTP_GET, handleLogCsv);
   server.on("/events.csv", HTTP_GET, handleEventCsv);
+  server.on("/api/files", HTTP_GET, handleFilesJson);
+  server.on("/download", HTTP_GET, handleDownloadFile);
+  server.on("/download/merged", HTTP_POST, handleDownloadMerged);
   server.on("/api/sync", HTTP_POST, handleSyncRtc);
   server.on("/api/logging/start", HTTP_POST, handleStartLogging);
   server.on("/api/logging/stop", HTTP_POST, handleStopLogging);
@@ -1456,10 +1837,11 @@ void setup() {
   Serial.println(sdOk ? "microSD logging enabled." : "microSD card not found; logging recent readings in RAM only.");
 
   if (rtcOk) {
-    DateTime bootRtcTime = rtc.now();
+    DateTime bootRtcTime;
+    bool bootTimeReadable = readRtcTime(bootRtcTime);
 
     rtcLostPower = rtc.lostPower();
-    rtcTimeWasBadAtBoot = bootRtcTime.year() < 2020;
+    rtcTimeWasBadAtBoot = !bootTimeReadable;  // covers year<2020 and garbage reads
     rtcBatteryConcern = rtcLostPower || rtcTimeWasBadAtBoot;
 
     if (rtcBatteryConcern) {
@@ -1492,6 +1874,22 @@ void setup() {
     lastLogMillis = millis();
     Serial.println("Auto-resuming logging after reboot.");
     appendEventLog("logging_start", "auto_resume", "logging resumed after reboot");
+  } else if (autoLoggingWanted && rtcOk && rtcWasSynced && !rtcTimeWasBadAtBoot) {
+    // The RTC reports lost power (typically a dead/missing coin cell during a
+    // brief supply blip) but its time still reads as valid and plausible. For
+    // an unattended deployment, losing days of data to a momentary blip is the
+    // worse failure, so resume logging and flag the concern loudly. Manual
+    // start via the web page still requires a fresh sync.
+    loggingEnabled = true;
+    resetAggregate();
+    lastLogMillis = millis();
+    Serial.println("Auto-resuming logging DESPITE RTC lost-power flag (time still plausible).");
+    Serial.println("Check/replace the RTC coin cell and re-sync when possible.");
+    appendEventLog(
+      "logging_start",
+      "auto_resume_rtc_concern",
+      "RTC lost-power flag set but time reads plausible; logging resumed - check/replace coin cell and re-sync"
+    );
   } else {
     loggingEnabled = false;
   }

@@ -98,7 +98,7 @@ void startBle(const char *deviceName) {
   );
 
   bleCommandCharacteristic->setCallbacks(new BleCommandCallbacks());
-  bleCommandCharacteristic->setValue("READY. Commands: WIFI_ON, WIFI_OFF, STATUS");
+  bleCommandCharacteristic->setValue("READY. Commands: WIFI_ON, WIFI_OFF, LOG_ON, LOG_OFF, STATUS");
 
   service->start();
 

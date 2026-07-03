@@ -106,9 +106,11 @@ Supported BLE commands:
 
 | Command | Purpose |
 | --- | --- |
-| `STATUS` | Returns logger status |
+| `STATUS` | Returns logger status (includes `logging=on/off`) |
 | `WIFI_ON` | Starts the Wi-Fi access point and webpage |
 | `WIFI_OFF` | Stops the Wi-Fi access point |
+| `LOG_ON` | Starts logging (requires a synced, valid RTC) |
+| `LOG_OFF` | Stops logging |
 
 Typical BLE test sequence:
 
@@ -247,6 +249,14 @@ The webpage's configuration form sets, persisted across reboots:
 - **Daily file rotation** — see above.
 - **Sensor heater cycling** — every 30 minutes the SHT-30's built-in heater runs for 30 seconds to drive off condensation, which otherwise pins RH near 100% and drifts the sensor in outdoor use. Sampling is suspended during the pulse and for a 90-second settle period, so heated readings never enter the averages (visible as a slightly lower `sample_count` in those minutes). Enabled by default; disable it for indoor use if preferred.
 
+### File browser
+
+The webpage lists the measurement logs, their timestamped archives, and the event log currently on the microSD card, each with its size and (for archives) its date. Any file can be downloaded directly, so old deployment segments can be retrieved without pulling the card. A **Type** dropdown (sensor / events) and a **From**/**To** date range filter the list; files without an embedded date (the live log, the event log, numbered fallbacks) always show regardless of the date range. The list is loaded on page open and refreshed with the **Refresh list** button and after a rotation.
+
+Multiple files of the same type can be selected with the row checkboxes and combined with **Download merged** into a single CSV — the shared header is written once and each file's data rows follow, streamed so an arbitrarily large merge needs no large buffer. Sensor and event files cannot be mixed in one merge because their columns differ.
+
+The download routes only serve files matching the log whitelist and reject any name containing a path separator or `..`, so they cannot be used to read arbitrary files from the card.
+
 ### microSD auto-remount
 
 If the SD card fails or is removed, the logger keeps running (RAM-only) and retries mounting every 30 seconds. Re-seating or swapping the card in the field works without a reboot; recovery is recorded as an `sd_remounted` event.
@@ -278,7 +288,11 @@ When logging is started, the choice is saved to the ESP32's non-volatile storage
 
 A manual **Stop logging** is also saved, so a stopped logger stays stopped after a reboot. Logging only resumes automatically if it was active when the reboot occurred.
 
-Two things do not carry across a reboot: the recent-readings table shown on the webpage (RAM only) and the partially accumulated current minute. The on-SD CSV file is appended to, so the logged record itself is continuous. If the RTC coin cell has died and the clock is lost, auto-resume is held off until the RTC is synced again, to avoid logging with an unreliable timestamp.
+Two things do not carry across a reboot: the recent-readings table shown on the webpage (RAM only) and the partially accumulated current minute. The on-SD CSV file is appended to, so the logged record itself is continuous.
+
+If the RTC reports lost power at boot (typically a dead or missing coin cell during a brief supply blip) but its time still reads as valid and plausible, logging resumes anyway and the concern is flagged loudly as a `logging_start / auto_resume_rtc_concern` event — for an unattended deployment, losing days of data to a momentary power blip is the worse failure. If the RTC time is actually invalid, auto-resume is held off until the RTC is synced again. Manual start from the web page always requires a valid, synced RTC.
+
+All timestamps are validated before they are written: a transient I2C glitch can make the RTC return a garbage time (impossible month/day/hour), so reads are checked and retried, corrupt timestamps never enter the CSVs, and an affected log row is simply deferred to the next interval as a slightly longer average.
 
 ## CSV columns
 
@@ -388,7 +402,6 @@ check the Serial Monitor for Wi-Fi errors.
 
 Ideas noted for future work, roughly in priority order:
 
-- **Web file browser for archived logs** — list the archived `temp_humidity_1min_*.csv` files on the microSD card and allow downloading (and possibly deleting) them from the webpage, so old deployment segments can be retrieved without pulling the card.
 - **Battery / supply voltage sensing** — read the input rail so the logger can report battery state and warn before brownout. Needs a check of the Data Logging Carrier schematic for an ADC-accessible VIN/battery sense pin (may need a resistor divider).
 - **Reload recent readings from SD at boot** — repopulate the webpage's recent-readings table from the tail of the current CSV after a reboot, so the display is continuous across the 7-day restart.
 - **Calendar-valid RTC sync check** — reject impossible dates (e.g. February 31) in `/api/sync` instead of relying on per-field range checks.

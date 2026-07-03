@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SHT30 Logger BLE Control</title>
+  <title>Datalogger BLE Control</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -193,9 +193,19 @@
         <button id="wifiOffButton" class="danger" onclick="sendCommand('WIFI_OFF')" disabled>WIFI_OFF</button>
       </div>
 
+      <div class="row">
+        <button id="logOnButton" class="good" onclick="sendCommand('LOG_ON')" disabled>LOG_ON</button>
+        <button id="logOffButton" class="danger" onclick="sendCommand('LOG_OFF')" disabled>LOG_OFF</button>
+      </div>
+
       <p class="small">
         After <code>WIFI_ON</code>, connect your phone or laptop to the logger Wi-Fi AP
         and open <code>http://192.168.4.1</code>.
+      </p>
+      <p class="small">
+        <code>LOG_ON</code> starts logging; the RTC must be synced and valid first
+        (use the webpage to sync). <code>LOG_OFF</code> stops it. The
+        <code>STATUS</code> reply shows the current <code>logging=</code> state.
       </p>
     </div>
 
@@ -226,6 +236,8 @@
     const statusButton = document.getElementById('statusButton');
     const wifiOnButton = document.getElementById('wifiOnButton');
     const wifiOffButton = document.getElementById('wifiOffButton');
+    const logOnButton = document.getElementById('logOnButton');
+    const logOffButton = document.getElementById('logOffButton');
 
     function log(message) {
       const timestamp = new Date().toLocaleTimeString();
@@ -244,6 +256,8 @@
       statusButton.disabled = !connected;
       wifiOnButton.disabled = !connected;
       wifiOffButton.disabled = !connected;
+      logOnButton.disabled = !connected;
+      logOffButton.disabled = !connected;
 
       if (!connected) {
         commandCharacteristic = null;
