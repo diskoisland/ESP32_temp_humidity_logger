@@ -181,6 +181,7 @@ The webpage also provides buttons to:
 - download the measurement CSV log
 - download the event log
 - start a new log file (archives the current one)
+- turn off Wi-Fi (the page disconnects; use the BLE `WIFI_ON` command to bring it back)
 - edit configuration: site ID, calibration offsets, daily rotation, sensor heater cycling
 
 ## RTC sync

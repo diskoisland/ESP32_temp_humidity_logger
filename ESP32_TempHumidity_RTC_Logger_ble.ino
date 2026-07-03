@@ -116,6 +116,7 @@ bool sdOk = false;
 bool loggingEnabled = false;
 bool autoLoggingWanted = false;
 bool rebootPending = false;
+bool wifiOffRequested = false;  // web request to drop Wi-Fi, applied in loop()
 
 bool rtcOk = false;
 bool rtcLostPower = false;
@@ -598,6 +599,13 @@ void handleStopLogging() {
   server.send(200, "text/plain", "Logging stopped.");
 }
 
+void handleWifiOff() {
+  // Reply first, then drop Wi-Fi on the next loop() tick. Calling stopWifi()
+  // here would tear down the web server from inside its own request handler.
+  server.send(200, "text/plain", "Turning Wi-Fi off; this page will disconnect.");
+  wifiOffRequested = true;
+}
+
 String statusJson() {
   DateTime now;
   bool rtcReadOk = readRtcTime(now);
@@ -814,6 +822,7 @@ void handleRoot() {
       <a class="button" href="/log.csv" onclick="flashButton(this)">Download CSV</a>
       <a class="button" href="/events.csv" onclick="flashButton(this)">Download Events</a>
       <button onclick="flashButton(this); newLogFile()">New log file</button>
+      <button class="secondary" onclick="flashButton(this); wifiOff()">Turn off Wi-Fi</button>
     </div>
 
     <div id="message"></div>
@@ -1020,6 +1029,20 @@ void handleRoot() {
       document.getElementById('message').textContent = await response.text();
       refresh();
       refreshFiles();
+    }
+
+    async function wifiOff() {
+      if (!confirm('Turn off Wi-Fi? This page will disconnect. Use the BLE WIFI_ON command to bring it back.')) return;
+
+      document.getElementById('message').textContent = 'Turning Wi-Fi off; this page will disconnect...';
+
+      // The AP drops right after replying, so the fetch may not resolve; that
+      // is expected and not an error.
+      try {
+        await fetch('/api/wifi/off', { method: 'POST' });
+      } catch (e) {
+        // Connection closed as Wi-Fi went down — intended.
+      }
     }
 
     let allFiles = [];
@@ -1649,6 +1672,7 @@ void setupRoutes() {
   server.on("/api/logging/start", HTTP_POST, handleStartLogging);
   server.on("/api/logging/stop", HTTP_POST, handleStopLogging);
   server.on("/api/logfile/new", HTTP_POST, handleNewLogFile);
+  server.on("/api/wifi/off", HTTP_POST, handleWifiOff);
   server.on("/api/config", HTTP_POST, handleSetConfig);
 
   // In the NimBLE variant, server.begin() is called only when Wi-Fi is enabled
@@ -1929,6 +1953,12 @@ void loop() {
   if (loggingEnabled && nowMillis - lastLogMillis >= LOG_INTERVAL_MS) {
     lastLogMillis = nowMillis;
     logAggregate();
+  }
+
+  if (wifiOffRequested) {
+    wifiOffRequested = false;
+    appendEventLog("wifi_off", "web_command", "WIFI_OFF from webpage");
+    stopWifi();
   }
 
   checkWifiAutoOff();
