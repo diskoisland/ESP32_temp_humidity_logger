@@ -145,6 +145,25 @@ unsigned long heaterLastCycleEndMillis = 0;
 
 int lastLogDay = -1;  // calendar day of the last logged row, for daily rotation
 
+// -------- Battery / power monitoring --------
+// The carrier puts input-rail/3 on MicroMod BATT_VIN/3 = ESP32 GPIO39
+// (ADC1_CH3, input-only, WiFi-safe). VIN = 3x the pin reading; on battery the
+// cell is ~VIN + one Schottky drop (D3). Used to gracefully close the log file
+// before a dying LiPo cuts off, and to show power source on the webpage.
+const int BATTERY_SENSE_PIN = 39;
+const uint32_t USB_PRESENT_MV = 4500;         // VIN above this => running on USB
+const uint32_t BATTERY_LOW_MV = 3200;         // cell at/under this => graceful close
+const uint32_t BATTERY_RECOVER_MV = 3400;     // cell must exceed this to clear the low latch
+const uint32_t SCHOTTKY_DROP_MV = 280;        // D3 drop between the cell and VIN
+const unsigned long POWER_CHECK_INTERVAL_MS = 5000;
+
+uint32_t vinMillivolts = 0;
+uint32_t batteryMillivolts = 0;               // 0 while on USB (cell not the source)
+bool onUsbPower = true;
+bool batteryLow = false;
+bool loggingSuspendedLowBatt = false;         // stopped for low battery; resume on power restore
+unsigned long lastPowerCheckMillis = 0;
+
 float sumTemperatureC = 0.0;
 float minTemperatureC = NAN;
 float maxTemperatureC = NAN;
@@ -568,6 +587,7 @@ bool startLogging(const char *source) {
 
   loggingEnabled = true;
   autoLoggingWanted = true;
+  loggingSuspendedLowBatt = false;  // manual start re-arms the low-battery auto-stop
   resetAggregate();
   lastLogMillis = millis();
 
@@ -580,6 +600,7 @@ void stopLogging(const char *source) {
   loggingEnabled = false;
   autoLoggingWanted = false;
   rebootPending = false;
+  loggingSuspendedLowBatt = false;  // manual stop clears the suspend (no unwanted auto-resume)
   resetAggregate();
 
   saveLoggingConfig();
@@ -649,7 +670,7 @@ String statusJson() {
   }
 
   String json;
-  json.reserve(1536);   // one allocation instead of ~50 reallocs while building
+  json.reserve(2048);   // one allocation instead of many reallocs while building
   json = "{";
   json += "\"sensorOk\":";
   json += sensorOk ? "true" : "false";
@@ -725,6 +746,14 @@ String statusJson() {
   json += (heaterOn || heaterSettling) ? "true" : "false";
   json += ",\"rtcTemperatureC\":";
   json += String(rtcOk ? rtc.getTemperature() : 0.0, 2);
+  json += ",\"powerSource\":\"";
+  json += onUsbPower ? "usb" : "battery";
+  json += "\",\"vinMillivolts\":";
+  json += String(vinMillivolts);
+  json += ",\"batteryMillivolts\":";
+  json += String(batteryMillivolts);
+  json += ",\"batteryLow\":";
+  json += batteryLow ? "true" : "false";
   json += "}";
 
   return json;
@@ -813,6 +842,7 @@ void handleRoot() {
       <div class="card"><div class="label">SD space</div><div id="sdSpace" class="value small">--</div></div>
       <div class="card"><div class="label">Site ID</div><div id="siteIdView" class="value small">--</div></div>
       <div class="card"><div class="label">RTC temp (enclosure)</div><div id="rtcTemp" class="value small">--</div></div>
+      <div class="card"><div class="label">Power</div><div id="powerStatus" class="value small">--</div></div>
     </section>
 
     <div class="row">
@@ -947,6 +977,11 @@ void handleRoot() {
 
       document.getElementById('rtcTemp').textContent =
         status.rtcOk ? `${status.rtcTemperatureC.toFixed(2)} C` : '--';
+
+      document.getElementById('powerStatus').textContent =
+        status.powerSource === 'usb'
+          ? `USB (${(status.vinMillivolts / 1000).toFixed(2)} V)`
+          : `Battery ${(status.batteryMillivolts / 1000).toFixed(2)} V${status.batteryLow ? ' — LOW' : ''}`;
 
       // Populate the config form once, so typing is not overwritten by polling.
       if (!configLoaded) {
@@ -1790,6 +1825,58 @@ void manageSensorHeater() {
   }
 }
 
+// Reads BATT_VIN/3 on GPIO39, updates the power state, and on low battery
+// gracefully closes the log (flushes the final partial minute, stops writing)
+// so a dying LiPo can't corrupt a file mid-write. Resumes automatically if
+// external power returns before the cell dies.
+void checkPowerStatus() {
+  if (millis() - lastPowerCheckMillis < POWER_CHECK_INTERVAL_MS) return;
+  lastPowerCheckMillis = millis();
+
+  // Average several samples; the 20k series resistor on GPIO39 makes a single
+  // ADC read a touch noisy. analogReadMilliVolts applies eFuse calibration.
+  uint32_t acc = 0;
+  const int samples = 16;
+  for (int i = 0; i < samples; i++) acc += analogReadMilliVolts(BATTERY_SENSE_PIN);
+
+  vinMillivolts = (acc / samples) * 3;  // carrier divides the input rail by 3
+  onUsbPower = vinMillivolts > USB_PRESENT_MV;
+  batteryMillivolts = onUsbPower ? 0 : (vinMillivolts + SCHOTTKY_DROP_MV);
+
+  // Latch low-battery with hysteresis so it can't chatter around the threshold.
+  if (onUsbPower) {
+    batteryLow = false;
+  } else if (!batteryLow && batteryMillivolts <= BATTERY_LOW_MV) {
+    batteryLow = true;
+  } else if (batteryLow && batteryMillivolts >= BATTERY_RECOVER_MV) {
+    batteryLow = false;
+  }
+
+  if (batteryLow && loggingEnabled && !loggingSuspendedLowBatt) {
+    // Flush whatever partial minute we have, then stop writing. autoLoggingWanted
+    // is deliberately left set, so a reboot after recharge auto-resumes.
+    loggingSuspendedLowBatt = true;
+    if (aggregateSampleCount > 0) logAggregate();
+    loggingEnabled = false;
+    resetAggregate();
+    appendEventLog(
+      "low_battery",
+      "power_monitor",
+      "battery ~" + String(batteryMillivolts) +
+      " mV; final row flushed and logging suspended to protect the log file"
+    );
+  } else if (loggingSuspendedLowBatt && onUsbPower) {
+    // External power restored before shutdown; resume if the RTC gate still passes.
+    loggingSuspendedLowBatt = false;
+    if (rtcOk && rtcWasSynced && !rtcBatteryConcern) {
+      loggingEnabled = true;
+      resetAggregate();
+      lastLogMillis = millis();
+      appendEventLog("logging_start", "power_restored", "external power restored; logging resumed");
+    }
+  }
+}
+
 void checkScheduledReboot() {
   if (millis() - bootMillis < REBOOT_INTERVAL_MS) return;
 
@@ -1844,6 +1931,12 @@ void setup() {
 
   bootMillis = millis();
   loadLoggingConfig();
+
+  // Battery/power sense on GPIO39 (BATT_VIN/3). 11 dB attenuation covers the
+  // ~1.1-1.7 V this pin sees. Force the first reading to happen immediately so
+  // the webpage shows a power source right away.
+  analogSetPinAttenuation(BATTERY_SENSE_PIN, ADC_11db);
+  lastPowerCheckMillis = millis() - POWER_CHECK_INTERVAL_MS;
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);   // 100 kHz for reliable I2C with SHT-30 cable + RTC
@@ -1965,6 +2058,7 @@ void loop() {
   ensureBleAdvertising();
   ensureSdCard();
   manageSensorHeater();
+  checkPowerStatus();
   checkScheduledReboot();
 
   esp_task_wdt_reset(); // reset the dog

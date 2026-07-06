@@ -169,6 +169,7 @@ The webpage shows:
 - SD card free space
 - site/deployment ID
 - RTC (enclosure) temperature
+- power source (USB or battery, with voltage)
 - recent one-minute averaged readings
 
 When a reading is valid but the RTC is not set or has lost power, the latest-reading field shows **Live reading (RTC not set)** instead of a timestamp, so live temperature and humidity are still displayed while the clock needs attention.
@@ -257,6 +258,14 @@ The webpage lists the measurement logs, their timestamped archives, and the even
 Multiple files of the same type can be selected with the row checkboxes and combined with **Download merged** into a single CSV — the shared header is written once and each file's data rows follow, streamed so an arbitrarily large merge needs no large buffer. Sensor and event files cannot be mixed in one merge because their columns differ.
 
 The download routes only serve files matching the log whitelist and reject any name containing a path separator or `..`, so they cannot be used to read arbitrary files from the card.
+
+### Power monitoring and low-battery graceful close
+
+When a LiPo is on the carrier's JST connector, the logger reads the input rail through the carrier's `BATT_VIN/3` divider on **GPIO39** (ADC1, WiFi-safe): `VIN = 3 × analogReadMilliVolts(39)`, and on battery the cell is about `VIN + 280 mV` (the D3 Schottky drop). The webpage's **Power** card shows `USB (x.xx V)` or `Battery x.xx V` (with `— LOW` when low).
+
+If the battery falls below ~3.2 V (with hysteresis, recovering at ~3.4 V), the logger flushes the current partial minute as a final row, stops writing, and records a `low_battery` event — so a dying cell can't corrupt a file mid-write. The ~3.2 V trip sits above the cell's ~3.0 V protection cutoff with margin for load sag, while still using most of the battery; it's a `#define` you can tune. It does **not** clear the auto-resume intent, so after recharge-and-reboot it resumes on its own; and if external power returns before the cell dies, it resumes immediately (`logging_start / power_restored`). A manual Start/Stop (web or BLE) re-arms this protection. Because the battery reaches the system through a diode-OR, a healthy LiPo also rides through brief USB interruptions without a reset.
+
+Readings use the ESP32's factory ADC calibration; the 20 kΩ source resistance adds a small offset you can trim against a meter if you need precise voltages.
 
 ### microSD auto-remount
 
@@ -403,7 +412,6 @@ check the Serial Monitor for Wi-Fi errors.
 
 Ideas noted for future work, roughly in priority order:
 
-- **Battery / supply voltage sensing** — read the input rail so the logger can report battery state and warn before brownout. Needs a check of the Data Logging Carrier schematic for an ADC-accessible VIN/battery sense pin (may need a resistor divider).
 - **Reload recent readings from SD at boot** — repopulate the webpage's recent-readings table from the tail of the current CSV after a reboot, so the display is continuous across the 7-day restart.
 - **Calendar-valid RTC sync check** — reject impossible dates (e.g. February 31) in `/api/sync` instead of relying on per-field range checks.
 
