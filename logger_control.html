@@ -148,7 +148,7 @@
 </head>
 <body>
   <main>
-    <h1>SHT30 Logger BLE Control</h1>
+    <h1>Lumberjack BLE Control</h1>
     <p>
       Use this page to connect to the ESP32 logger over Bluetooth LE and send
       <code>STATUS</code>, <code>WIFI_ON</code>, and <code>WIFI_OFF</code> commands.
@@ -298,7 +298,7 @@
 
         bleDevice = await navigator.bluetooth.requestDevice({
           filters: [
-            { name: 'SHT30-Logger' },
+            { name: 'LumberjackBLE' },
             { services: [SERVICE_UUID] }
           ],
           optionalServices: [SERVICE_UUID]

@@ -97,7 +97,7 @@ const char *AP_PASSWORD = "change-this-password";
 The logger advertises as:
 
 ```text
-SHT30-Logger
+LumberjackBLE
 ```
 
 Use a BLE app such as **nRF Connect** to connect to the device.

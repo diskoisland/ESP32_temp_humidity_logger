@@ -44,7 +44,7 @@
 #include <esp_system.h>
 
 // -------- BLE settings --------
-const char *BLE_DEVICE_NAME = "SHT30-Logger";
+const char *BLE_DEVICE_NAME = "LumberjackBLE";
 
 // -------- User settings --------
 const unsigned long SAMPLE_INTERVAL_MS = 5000;      // Sensor sampling time, 5 sec
