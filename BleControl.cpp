@@ -57,6 +57,13 @@ class BleCommandCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// Static singletons rather than `new` per startBle(): low-power mode cycles BLE
+// off/on for every advertising window, so heap-allocating the callbacks each
+// time would leak (NimBLE does not free characteristic callbacks, and we tell
+// it not to free the server callback).
+static BleServerCallbacks bleServerCallbacks;
+static BleCommandCallbacks bleCommandCallbacks;
+
 bool takeBleCommand(String &commandOut) {
   bool hadCommand = false;
 
@@ -85,7 +92,7 @@ void startBle(const char *deviceName) {
   NimBLEDevice::init(deviceName);
 
   bleServer = NimBLEDevice::createServer();
-  bleServer->setCallbacks(new BleServerCallbacks());
+  bleServer->setCallbacks(&bleServerCallbacks, false);  // static: don't let NimBLE free it
   bleServer->advertiseOnDisconnect(true);
 
   NimBLEService *service = bleServer->createService(BLE_SERVICE_UUID);
@@ -97,7 +104,7 @@ void startBle(const char *deviceName) {
     NIMBLE_PROPERTY::NOTIFY
   );
 
-  bleCommandCharacteristic->setCallbacks(new BleCommandCallbacks());
+  bleCommandCharacteristic->setCallbacks(&bleCommandCallbacks);
   bleCommandCharacteristic->setValue("READY. Commands: WIFI_ON, WIFI_OFF, LOG_ON, LOG_OFF, STATUS");
 
   service->start();
@@ -109,6 +116,25 @@ void startBle(const char *deviceName) {
 
   Serial.print("NimBLE started. Device name: ");
   Serial.println(deviceName);
+}
+
+void stopBle() {
+  // Fully tear down BLE (releases the BT controller) so low-power mode can
+  // light-sleep at low current between advertising windows.
+  if (bleServer == nullptr) return;
+
+  NimBLEDevice::deinit(true);
+  bleServer = nullptr;
+  bleCommandCharacteristic = nullptr;
+  Serial.println("NimBLE stopped for low-power sleep.");
+}
+
+bool bleClientConnected() {
+  return bleServer != nullptr && bleServer->getConnectedCount() > 0;
+}
+
+bool bleIsActive() {
+  return bleServer != nullptr;
 }
 
 void ensureBleAdvertising() {

@@ -4,6 +4,9 @@
 #include <Arduino.h>
 
 void startBle(const char *deviceName);
+void stopBle();               // fully tear down BLE (low-power sleep windows)
+bool bleClientConnected();    // true while a client is connected
+bool bleIsActive();           // true while the BLE stack is initialized
 void sendBleResponse(const String &response);
 
 // Called from loop() on the main task. If a BLE write has arrived since the

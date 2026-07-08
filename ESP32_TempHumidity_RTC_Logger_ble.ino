@@ -42,6 +42,7 @@
 #include <esp_arduino_version.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
 
 // -------- BLE settings --------
 const char *BLE_DEVICE_NAME = "LumberjackBLE";
@@ -134,7 +135,21 @@ float tempOffsetC = 0.0;            // per-unit calibration offset, applied at s
 float humidityOffset = 0.0;
 bool dailyRotateEnabled = false;    // archive the log file at each midnight boundary
 bool sensorHeaterEnabled = true;    // periodic SHT-30 condensation purge
+bool lowPowerMode = false;          // light-sleep between samples on battery (long runs)
 uint32_t rtcLastSyncUnix = 0;       // for drift-rate calculation between syncs
+
+// -------- Low-power mode (light sleep + periodic BLE windows) --------
+// Only active on battery. Between samples the CPU light-sleeps (RAM retained,
+// millis() keeps advancing) with BLE torn down; every window interval BLE comes
+// up and stays awake/connectable for the window duration. Connecting keeps it
+// awake for the whole session. These two knobs trade responsiveness (short
+// interval = connect sooner) against runtime (long interval = lower average).
+const unsigned long LOWPOWER_BLE_WINDOW_MS = 20000;             // advertise ~20 s
+const unsigned long LOWPOWER_BLE_INTERVAL_MS = 5UL * 60UL * 1000UL;  // window every 5 min
+
+enum LowPowerPhase { LP_WINDOW, LP_SLEEP };
+LowPowerPhase lowPowerPhase = LP_WINDOW;  // boot with BLE up so a client can connect
+unsigned long lowPowerPhaseUntil = 0;     // window end (LP_WINDOW) / next window (LP_SLEEP)
 
 // SHT-30 heater state machine (see manageSensorHeater()).
 bool heaterOn = false;
@@ -379,6 +394,7 @@ void saveLoggingConfig() {
   prefs.putFloat("hOffset", humidityOffset);
   prefs.putBool("dailyRot", dailyRotateEnabled);
   prefs.putBool("heater", sensorHeaterEnabled);
+  prefs.putBool("lowPower", lowPowerMode);
   prefs.putULong("lastSync", rtcLastSyncUnix);
   prefs.end();
 }
@@ -394,6 +410,7 @@ void loadLoggingConfig() {
   humidityOffset = prefs.getFloat("hOffset", 0.0);
   dailyRotateEnabled = prefs.getBool("dailyRot", false);
   sensorHeaterEnabled = prefs.getBool("heater", true);
+  lowPowerMode = prefs.getBool("lowPower", false);
   rtcLastSyncUnix = prefs.getULong("lastSync", 0);
   prefs.end();
 }
@@ -742,6 +759,8 @@ String statusJson() {
   json += dailyRotateEnabled ? "true" : "false";
   json += ",\"heaterEnabled\":";
   json += sensorHeaterEnabled ? "true" : "false";
+  json += ",\"lowPowerMode\":";
+  json += lowPowerMode ? "true" : "false";
   json += ",\"heaterActive\":";
   json += (heaterOn || heaterSettling) ? "true" : "false";
   json += ",\"rtcTemperatureC\":";
@@ -867,6 +886,7 @@ void handleRoot() {
       <div class="row">
         <label><input id="cfgDailyRotate" type="checkbox"> Daily file rotation</label>
         <label><input id="cfgHeater" type="checkbox"> Sensor heater cycling</label>
+        <label><input id="cfgLowPower" type="checkbox"> Low-power mode (battery)</label>
         <button onclick="flashButton(this); saveConfig()">Save configuration</button>
       </div>
     </div>
@@ -991,6 +1011,7 @@ void handleRoot() {
         document.getElementById('cfgHumOffset').value = status.humidityOffset;
         document.getElementById('cfgDailyRotate').checked = status.dailyRotate;
         document.getElementById('cfgHeater').checked = status.heaterEnabled;
+        document.getElementById('cfgLowPower').checked = status.lowPowerMode;
       }
 
       const log = await fetch('/api/log').then(r => r.json());
@@ -1044,7 +1065,8 @@ void handleRoot() {
         tempOffsetC: document.getElementById('cfgTempOffset').value || '0',
         humidityOffset: document.getElementById('cfgHumOffset').value || '0',
         dailyRotate: document.getElementById('cfgDailyRotate').checked ? 'true' : 'false',
-        heaterEnabled: document.getElementById('cfgHeater').checked ? 'true' : 'false'
+        heaterEnabled: document.getElementById('cfgHeater').checked ? 'true' : 'false',
+        lowPowerMode: document.getElementById('cfgLowPower').checked ? 'true' : 'false'
       });
 
       const response = await fetch('/api/config', {
@@ -1676,6 +1698,10 @@ void handleSetConfig() {
     sensorHeaterEnabled = server.arg("heaterEnabled") == "true";
   }
 
+  if (server.hasArg("lowPowerMode")) {
+    lowPowerMode = server.arg("lowPowerMode") == "true";
+  }
+
   saveLoggingConfig();
 
   // Config changes are provenance: calibration offsets in particular must be
@@ -1687,7 +1713,8 @@ void handleSetConfig() {
     ", tempOffsetC=" + String(tempOffsetC, 2) +
     ", humidityOffset=" + String(humidityOffset, 1) +
     ", dailyRotate=" + (dailyRotateEnabled ? "true" : "false") +
-    ", heater=" + (sensorHeaterEnabled ? "true" : "false")
+    ", heater=" + (sensorHeaterEnabled ? "true" : "false") +
+    ", lowPower=" + (lowPowerMode ? "true" : "false")
   );
 
   server.send(200, "text/plain", "Configuration saved.");
@@ -1877,6 +1904,60 @@ void checkPowerStatus() {
   }
 }
 
+// Low-power state machine (see the config block). Called at the end of loop().
+// On battery with the feature on, it light-sleeps between samples with BLE torn
+// down, and periodically brings BLE up for a connectable window.
+void manageLowPower() {
+  // Full power whenever the feature is off, Wi-Fi is up, or running on USB.
+  // Leave BLE as-is and reset the window so the next battery run starts fresh.
+  if (!lowPowerMode || isWifiEnabled() || onUsbPower) {
+    lowPowerPhase = LP_WINDOW;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // A connected client keeps us fully awake and extends the window so a session
+  // isn't cut off mid-use.
+  if (bleClientConnected()) {
+    lowPowerPhase = LP_WINDOW;
+    lowPowerPhaseUntil = now + LOWPOWER_BLE_WINDOW_MS;
+    return;
+  }
+
+  if (lowPowerPhase == LP_WINDOW) {
+    if (!bleIsActive()) startBle(BLE_DEVICE_NAME);  // ensure BLE is up for the window
+    if (now >= lowPowerPhaseUntil) {                // window elapsed, nobody connected
+      stopBle();
+      lowPowerPhase = LP_SLEEP;
+      lowPowerPhaseUntil = now + LOWPOWER_BLE_INTERVAL_MS;
+    }
+    return;                                         // stay awake while advertising
+  }
+
+  // LP_SLEEP: BLE torn down. Open a new window when due, else light-sleep until
+  // the next sample or the next window, whichever comes first.
+  if (now >= lowPowerPhaseUntil) {
+    startBle(BLE_DEVICE_NAME);
+    lowPowerPhase = LP_WINDOW;
+    lowPowerPhaseUntil = now + LOWPOWER_BLE_WINDOW_MS;
+    return;
+  }
+
+  unsigned long sinceSample = now - lastSampleMillis;
+  unsigned long msToSample = (sinceSample >= SAMPLE_INTERVAL_MS)
+                               ? 0 : (SAMPLE_INTERVAL_MS - sinceSample);
+  unsigned long msToWindow = lowPowerPhaseUntil - now;
+  unsigned long sleepMs = min(msToSample, msToWindow);
+
+  if (sleepMs < 50) return;  // too short to be worth a sleep cycle; let loop spin
+
+  esp_task_wdt_reset();
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+  esp_light_sleep_start();   // RAM retained; millis() advances across the sleep
+  esp_task_wdt_reset();
+}
+
 void checkScheduledReboot() {
   if (millis() - bootMillis < REBOOT_INTERVAL_MS) return;
 
@@ -2015,6 +2096,11 @@ void setup() {
   setupWifiControl(&server, AP_SSID, AP_PASSWORD);
   startBle(BLE_DEVICE_NAME);
 
+  // Boot with an open BLE window so a client can connect right after power-up,
+  // even in low-power mode, before the first sleep cycle.
+  lowPowerPhase = LP_WINDOW;
+  lowPowerPhaseUntil = millis() + LOWPOWER_BLE_WINDOW_MS;
+
   // Wi-Fi starts off by default in the NimBLE variant.
   // Send BLE command WIFI_ON to enable the webpage.
 
@@ -2024,6 +2110,7 @@ void setup() {
   lastSampleMillis = millis();
   lastLogMillis = millis();
 }
+
 
 void loop() {
   // Execute any BLE command on the main task (never on the NimBLE host task).
@@ -2060,6 +2147,6 @@ void loop() {
   manageSensorHeater();
   checkPowerStatus();
   checkScheduledReboot();
-
   esp_task_wdt_reset(); // reset the dog
+  manageLowPower();     // light-sleep here on battery in low-power mode
 }

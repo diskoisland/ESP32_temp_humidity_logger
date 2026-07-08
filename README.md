@@ -183,7 +183,7 @@ The webpage also provides buttons to:
 - download the event log
 - start a new log file (archives the current one)
 - turn off Wi-Fi (the page disconnects; use the BLE `WIFI_ON` command to bring it back)
-- edit configuration: site ID, calibration offsets, daily rotation, sensor heater cycling
+- edit configuration: site ID, calibration offsets, daily rotation, sensor heater cycling, low-power mode
 
 ## RTC sync
 
@@ -258,6 +258,12 @@ The webpage lists the measurement logs, their timestamped archives, and the even
 Multiple files of the same type can be selected with the row checkboxes and combined with **Download merged** into a single CSV — the shared header is written once and each file's data rows follow, streamed so an arbitrarily large merge needs no large buffer. Sensor and event files cannot be mixed in one merge because their columns differ.
 
 The download routes only serve files matching the log whitelist and reject any name containing a path separator or `..`, so they cannot be used to read arbitrary files from the card.
+
+### Low-power mode (long battery runs)
+
+For extended battery deployments, enable **Low-power mode** in the configuration form. It only takes effect **on battery** (on USB the logger stays fully awake and connectable); when running on the LiPo it light-sleeps between the 5-second samples, dropping average draw from ~40–80 mA to a few mA (roughly days → weeks). RAM is retained across light sleep, so the ring buffer, aggregates, and 1-minute min/avg/max are unchanged, and the DS3231 keeps time.
+
+Because the stock Arduino-ESP32 core ships with power management disabled, BLE cannot stay connectable *during* light sleep. Instead, BLE is torn down while sleeping and brought up for a **connectable window** (~20 s) every interval (~5 min); connecting during a window keeps the logger awake for your whole session, and boot opens an initial window. So in the field you may wait up to one interval for the device to appear, then connect normally. The window duration and interval are `#define`s (`LOWPOWER_BLE_WINDOW_MS` / `LOWPOWER_BLE_INTERVAL_MS`) — shorter/rarer windows trade responsiveness for longer runtime. Sending `WIFI_ON` during a session bumps back to full power until `WIFI_OFF`. Note the SHT-30 heater is a meaningful battery draw; consider disabling it for long battery runs.
 
 ### Power monitoring and low-battery graceful close
 
@@ -412,11 +418,6 @@ check the Serial Monitor for Wi-Fi errors.
 
 Ideas noted for future work, roughly in priority order:
 
-- **Low-power / long battery run (light sleep + BLE modem sleep)** — for extended battery deployments, let the CPU light-sleep between the 5-second samples while BLE stays advertising and connectable, so average draw drops from ~40–80 mA to ~1–4 mA (~10–20×, i.e. days → weeks on a typical LiPo). RAM is retained, so the ring buffer, aggregates, and 1-minute min/avg/max are unchanged, and the DS3231 keeps time across sleeps.
-  - **Why BLE wake works here:** deep sleep cannot be woken by BLE (radio off; classic ESP32 has no radio wake source), but light sleep with BLE modem sleep keeps the controller alive using the board's **32.768 kHz crystal** (present on the MicroMod ESP32, Y2 on 32K_XP/XN) — so no physical wake button is needed; BLE is the always-on low-power control channel.
-  - **Design:** enable ESP-IDF automatic light sleep (`esp_pm`) with the BLE controller sleep clock on the 32 kHz crystal; keep the existing split where WiFi is the on-demand high-power channel — a `WIFI_ON`/BLE session bumps to full performance, then drop back to light sleep on `WIFI_OFF`/idle. Main tuning knob is the **BLE advertising interval** (slower = lower current). Gate everything behind a persisted `lowPowerMode` config flag.
-  - **Gotchas:** timing must move off `millis()` (the FreeRTOS tick pauses during light sleep) onto sleep-duration/RTC accounting; feed the watchdog immediately before/after each sleep; the `loop()` periodic tasks (heater, power check, SD remount, low-battery close) run once per wake. Advanced power-management config, not a small hook — NimBLE-on-Arduino makes it a bit fiddly.
-  - **Deeper-savings fallback:** if weeks isn't enough, periodic advertising windows (mostly radios-off sleep at µA–low-mA, waking every N minutes to advertise ~30 s) approach deep-sleep runtime at the cost of waiting up to N minutes to become connectable.
 
 - **Reload recent readings from SD at boot** — repopulate the webpage's recent-readings table from the tail of the current CSV after a reboot, so the display is continuous across the 7-day restart.
 - **Calendar-valid RTC sync check** — reject impossible dates (e.g. February 31) in `/api/sync` instead of relying on per-field range checks.
