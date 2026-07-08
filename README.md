@@ -403,6 +403,38 @@ check the Serial Monitor for Wi-Fi errors.
 - Confirm the chip select pin is GPIO 5.
 - Try a different microSD card.
 
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| ADC | Analog-to-Digital Converter — reads an analog voltage (e.g. battery sense on GPIO39) |
+| AP | Access Point — the Wi-Fi network the logger hosts so you can reach its webpage |
+| BATT_VIN/3 | MicroMod pin carrying the input rail voltage divided by 3, for battery monitoring |
+| BLE | Bluetooth Low Energy — the low-power radio used for the control channel |
+| brownout | A supply-voltage dip below the safe threshold, which resets the ESP32 |
+| CSV | Comma-Separated Values — the plain-text spreadsheet format of the log files |
+| DS3231 | The precision real-time clock (RTC) chip used for timestamps |
+| ESP32 | The Wi-Fi/Bluetooth microcontroller on the MicroMod processor board |
+| FAT32 | The microSD card file system the logger reads and writes |
+| GPIO | General-Purpose Input/Output — a microcontroller pin |
+| I2C | Inter-Integrated Circuit — the two-wire bus shared by the sensor and RTC |
+| LDO | Low-Dropout regulator — the part making the board's 3.3 V rail |
+| LiPo | Lithium-Polymer rechargeable battery |
+| mDNS | Multicast DNS — lets the page be reached at `datalogger.local` |
+| MicroMod | SparkFun's swappable processor-board form factor (M.2 connector) |
+| NVS | Non-Volatile Storage — flash area (via Preferences) where settings persist |
+| OTA | Over-The-Air — updating firmware over Wi-Fi (a planned upgrade) |
+| Qwiic / STEMMA QT | Solderless 4-pin I2C connector standards (SparkFun / Adafruit) |
+| RH | Relative Humidity (percent) |
+| RTC | Real-Time Clock — keeps the date/time, battery-backed so it survives power loss |
+| Schottky | A low-forward-drop diode (D3 on the carrier, in the battery path) |
+| SD / microSD | Secure Digital — the removable memory card used for logging |
+| SHT-30 | The Sensirion temperature/relative-humidity sensor |
+| SPI | Serial Peripheral Interface — the bus used to talk to the microSD card |
+| SSID | Service Set Identifier — the Wi-Fi network name |
+| UTC | Coordinated Universal Time — the reference time zone; rows store the local offset from it |
+| WDT | Watchdog Timer — reboots the logger if the firmware ever hangs |
+
 ## Repository files
 
 | File | Purpose |
