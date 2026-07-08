@@ -412,6 +412,12 @@ check the Serial Monitor for Wi-Fi errors.
 
 Ideas noted for future work, roughly in priority order:
 
+- **Low-power / long battery run (light sleep + BLE modem sleep)** — for extended battery deployments, let the CPU light-sleep between the 5-second samples while BLE stays advertising and connectable, so average draw drops from ~40–80 mA to ~1–4 mA (~10–20×, i.e. days → weeks on a typical LiPo). RAM is retained, so the ring buffer, aggregates, and 1-minute min/avg/max are unchanged, and the DS3231 keeps time across sleeps.
+  - **Why BLE wake works here:** deep sleep cannot be woken by BLE (radio off; classic ESP32 has no radio wake source), but light sleep with BLE modem sleep keeps the controller alive using the board's **32.768 kHz crystal** (present on the MicroMod ESP32, Y2 on 32K_XP/XN) — so no physical wake button is needed; BLE is the always-on low-power control channel.
+  - **Design:** enable ESP-IDF automatic light sleep (`esp_pm`) with the BLE controller sleep clock on the 32 kHz crystal; keep the existing split where WiFi is the on-demand high-power channel — a `WIFI_ON`/BLE session bumps to full performance, then drop back to light sleep on `WIFI_OFF`/idle. Main tuning knob is the **BLE advertising interval** (slower = lower current). Gate everything behind a persisted `lowPowerMode` config flag.
+  - **Gotchas:** timing must move off `millis()` (the FreeRTOS tick pauses during light sleep) onto sleep-duration/RTC accounting; feed the watchdog immediately before/after each sleep; the `loop()` periodic tasks (heater, power check, SD remount, low-battery close) run once per wake. Advanced power-management config, not a small hook — NimBLE-on-Arduino makes it a bit fiddly.
+  - **Deeper-savings fallback:** if weeks isn't enough, periodic advertising windows (mostly radios-off sleep at µA–low-mA, waking every N minutes to advertise ~30 s) approach deep-sleep runtime at the cost of waiting up to N minutes to become connectable.
+
 - **Reload recent readings from SD at boot** — repopulate the webpage's recent-readings table from the tail of the current CSV after a reboot, so the display is continuous across the 7-day restart.
 - **Calendar-valid RTC sync check** — reject impossible dates (e.g. February 31) in `/api/sync` instead of relying on per-field range checks.
 
